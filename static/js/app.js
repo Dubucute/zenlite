@@ -5,12 +5,15 @@
 // ── State ───────────────────────────────────────────────────────────────────
 let allModels = [];
 let allProviders = [];
+let lastLogSeq = 0;
+let logPaused = false;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
     loadStatus();
     loadProviders();
     loadModels();
+    loadLogs();
 
     // Toggle API key field based on provider selection
     document.getElementById('providerSelect').addEventListener('change', (e) => {
@@ -18,8 +21,20 @@ document.addEventListener('DOMContentLoaded', () => {
         apiKeyRow.style.display = e.target.value === 'opencode_zen' ? 'block' : 'none';
     });
 
-    // Auto-refresh stats every 5 seconds
+    // Log viewer controls
+    document.getElementById('logClearBtn').addEventListener('click', () => {
+        const view = document.getElementById('logView');
+        view.querySelectorAll('.log-line').forEach(n => n.remove());
+        lastLogSeq = 0;
+        showLogEmpty();
+    });
+    document.getElementById('logAutoscroll').addEventListener('change', (e) => {
+        if (e.target.checked) scrollLogsToBottom();
+    });
+
+    // Auto-refresh stats every 5 seconds, logs every 2 seconds
     setInterval(loadStatus, 5000);
+    setInterval(loadLogs, 2000);
 });
 
 // ── API Calls ───────────────────────────────────────────────────────────────
@@ -215,6 +230,71 @@ async function sendStreamTest(headers, body, responseEl) {
     if (!fullResponse) {
         responseEl.textContent = '(empty response)';
     }
+}
+
+// ── Live Logs ───────────────────────────────────────────────────────────────
+
+async function loadLogs() {
+    try {
+        const res = await fetch(`/dashboard/logs?limit=200&after=${lastLogSeq}`);
+        const data = await res.json();
+        const logs = data.logs || [];
+        if (!logs.length) return;
+
+        const view = document.getElementById('logView');
+        const autoscroll = document.getElementById('logAutoscroll').checked;
+        const atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 40;
+
+        logs.forEach(log => {
+            lastLogSeq = Math.max(lastLogSeq, log.seq);
+            view.appendChild(renderLogLine(log));
+        });
+
+        const empty = document.getElementById('logEmpty');
+        if (empty) empty.style.display = 'none';
+
+        // Prune old log lines so the DOM doesn't grow forever (keep #logEmpty)
+        const lines = view.querySelectorAll('.log-line');
+        for (let i = 0; i < lines.length - 400; i++) lines[i].remove();
+
+        if (autoscroll || atBottom) scrollLogsToBottom();
+    } catch (e) {
+        // Server unreachable — try again next tick
+    }
+}
+
+function renderLogLine(log) {
+    const line = document.createElement('div');
+    line.className = `log-line log-${(log.level || 'info').toLowerCase()}`;
+
+    const time = document.createElement('span');
+    time.className = 'log-time';
+    time.textContent = log.time || '';
+
+    const level = document.createElement('span');
+    level.className = 'log-level';
+    level.textContent = (log.level || 'INFO').toUpperCase();
+
+    const logger = document.createElement('span');
+    logger.className = 'log-logger';
+    logger.textContent = (log.logger || '').replace('zenlite', 'zl');
+
+    const msg = document.createElement('span');
+    msg.className = 'log-msg';
+    msg.textContent = log.message || '';
+
+    line.append(time, level, logger, msg);
+    return line;
+}
+
+function showLogEmpty() {
+    const el = document.getElementById('logEmpty');
+    if (el) el.style.display = 'block';
+}
+
+function scrollLogsToBottom() {
+    const view = document.getElementById('logView');
+    view.scrollTop = view.scrollHeight;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ AI Gateway with OpenCode Free + Zen providers and proxy rotation.
 """
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -11,9 +12,18 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.config import HOST, PORT, DASHBOARD_TITLE, DASHBOARD_VERSION, ZENLITE_API_KEY
+from app.config import (
+    HOST,
+    PORT,
+    DASHBOARD_TITLE,
+    DASHBOARD_VERSION,
+    ZENLITE_API_KEY,
+    OPENAI_BASE_URL,
+    USE_FREE_PROXIES,
+)
 from app.router.chat import router as chat_router
 from app.dashboard.routes import router as dashboard_router
+from app.logs import install_log_bridge
 from app.proxy.manager import proxy_manager
 
 # ── Logging Setup ────────────────────────────────────────────────────────────
@@ -33,7 +43,21 @@ async def lifespan(app: FastAPI):
     logger.info("  Listening on http://%s:%s", HOST, PORT)
     logger.info("  Dashboard  → http://%s:%s/", HOST, PORT)
     logger.info("  API Base   → http://%s:%s/v1/", HOST, PORT)
+    logger.info("  Upstream   → %s", OPENAI_BASE_URL)
+    logger.info(
+        "  Auth /v1/* : %s",
+        "ENABLED (ZENLITE_API_KEY set)" if ZENLITE_API_KEY else "disabled (open access)",
+    )
+    logger.info(
+        "  Proxies    : %s (%d IPVanish + %d free)",
+        "enabled" if USE_FREE_PROXIES else "IPVanish only",
+        len(proxy_manager._ipvanish_pool),
+        len(proxy_manager._free_pool),
+    )
     logger.info("═" * 60)
+
+    # Bridge ZenLite logs into the dashboard's live log viewer.
+    install_log_bridge()
 
     # Create the shared direct-path client before serving, then fetch free
     # proxies on startup and start the background refresh.
@@ -76,6 +100,24 @@ async def gateway_auth(request: Request, call_next):
         if auth.strip() != f"Bearer {ZENLITE_API_KEY}":
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     return await call_next(request)
+
+
+# ── Request Logging ──────────────────────────────────────────────────────────
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every request (method, path, status, duration). Registered last so
+    it wraps the other middleware and also logs rejected auth requests."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        "%s %s -> %d (%.0f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
 
 
 # ── Root → Dashboard ────────────────────────────────────────────────────────

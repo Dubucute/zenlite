@@ -116,6 +116,23 @@
             <div id="modelsList" class="models-grid">Loading...</div>
         </div>
 
+        <!-- Live Logs -->
+        <div class="panel full-width">
+            <div class="log-header">
+                <h2>Live Logs</h2>
+                <div class="log-controls">
+                    <label class="log-toggle">
+                        <input type="checkbox" id="logAutoscroll" checked>
+                        <span>Auto-scroll</span>
+                    </label>
+                    <button class="btn-small" id="logClearBtn">Clear</button>
+                </div>
+            </div>
+            <div class="log-view" id="logView">
+                <div class="log-empty" id="logEmpty">Waiting for log entries…</div>
+            </div>
+        </div>
+
         <!-- Footer -->
         <footer class="footer">
             <p>ZenLite AI Gateway — OpenAI-Compatible API at <code>/v1/chat/completions</code></p>

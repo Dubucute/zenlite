@@ -357,6 +357,126 @@ textarea {
     color: var(--text-muted);
 }
 
+/* Live Logs */
+.log-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+}
+
+.log-header h2 {
+    margin: 0;
+    border: none;
+    padding: 0;
+}
+
+.log-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.log-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+}
+
+.log-toggle input {
+    accent-color: var(--accent);
+}
+
+.btn-small {
+    padding: 5px 12px;
+    background: var(--bg-input);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-small:hover {
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+
+.log-view {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    max-height: 360px;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.log-empty {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 12px;
+}
+
+.log-line {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
+}
+
+.log-line > .log-msg {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.log-line:hover {
+    background: rgba(108, 92, 231, 0.06);
+    border-radius: 4px;
+}
+
+.log-time {
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.log-level {
+    flex-shrink: 0;
+    min-width: 52px;
+    font-weight: 700;
+}
+
+.log-logger {
+    color: var(--text-muted);
+    flex-shrink: 0;
+    min-width: 36px;
+}
+
+.log-msg {
+    color: var(--text-primary);
+}
+
+.log-info .log-level { color: var(--blue); }
+.log-warning .log-level { color: var(--yellow); }
+.log-error .log-level { color: var(--red); }
+.log-critical .log-level { color: var(--red); }
+.log-debug .log-level { color: var(--text-muted); }
+
+.log-error .log-msg, .log-critical .log-msg {
+    color: #ff8a80;
+}
+
 /* Footer */
 .footer {
     text-align: center;
