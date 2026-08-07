@@ -17,6 +17,10 @@ PORT = int(os.getenv("ZENLITE_PORT", "8100"))
 
 # ── OpenCode Base URL ────────────────────────────────────────────────────────
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
+# Allow overriding the OpenAI base URL. Defaults to OPENCODE_BASE_URL so
+# clients that expect an OpenAI-compatible endpoint can be pointed at
+# OpenCode's custom implementation by setting `OPENAI_BASE_URL`.
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", OPENCODE_BASE_URL)
 
 
 # ── Provider Definitions ─────────────────────────────────────────────────────
@@ -68,6 +72,28 @@ def strip_model_prefix(model: str) -> str:
     return model
 
 
+# ── Model Aliases ────────────────────────────────────────────────────────────
+# Map common client model names (GitHub Copilot defaults, generic names) to
+# free OpenCode models so clients work with zero configuration.
+MODEL_ALIASES = {
+    "gpt-4o": "oc/deepseek-v4-flash-free",
+    "gpt-4o-mini": "oc/deepseek-v4-flash-free",
+    "gpt-4.1": "oc/deepseek-v4-flash-free",
+    "gpt-4.1-mini": "oc/deepseek-v4-flash-free",
+    "gpt-4.1-nano": "oc/deepseek-v4-flash-free",
+    "gpt-5": "oc/deepseek-v4-flash-free",
+    "gpt-5-mini": "oc/deepseek-v4-flash-free",
+    "gpt-5-nano": "oc/mimo-v2.5-free",
+    "claude-3-5-sonnet": "oc/mimo-v2.5-free",
+    "claude-3-7-sonnet": "oc/deepseek-v4-flash-free",
+    "claude-sonnet-4": "oc/deepseek-v4-flash-free",
+    "gemini-2.5-pro": "oc/deepseek-v4-flash-free",
+    "gemini-2.5-flash": "oc/mimo-v2.5-free",
+    "deepseek-chat": "oc/deepseek-v4-flash-free",
+    "deepseek-reasoner": "oc/deepseek-v4-flash-free",
+}
+
+
 PROVIDERS: dict[str, ProviderConfig] = {
     "opencode_free": ProviderConfig(
         id="opencode_free",
@@ -84,6 +110,14 @@ PROVIDERS: dict[str, ProviderConfig] = {
         no_auth=False,
         description="Requires an OpenCode API key. Models prefixed with opencode/.",
         models=_prefixed_models(ZEN_MODEL_PREFIX, RAW_MODELS),
+    ),
+    "openai": ProviderConfig(
+        id="openai",
+        name="OpenAI",
+        base_url=f"{OPENAI_BASE_URL}/chat/completions",
+        no_auth=False,
+        description="OpenAI-compatible endpoint (defaults to OpenCode Zen). Handles all traffic with full tool-calling support.",
+        models=RAW_MODELS + list(MODEL_ALIASES),
     ),
 }
 
@@ -149,3 +183,9 @@ async def fetch_free_proxies() -> list[str]:
 # ── Dashboard Settings ───────────────────────────────────────────────────────
 DASHBOARD_TITLE = "ZenLite — AI Gateway"
 DASHBOARD_VERSION = "1.0.0"
+
+
+# Use free proxies from Proxifly when True. Set to False to force using only
+# the paid IPVanish SOCKS5 pool (recommended for reliability).
+USE_FREE_PROXIES = False
+

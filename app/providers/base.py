@@ -15,6 +15,26 @@ from app.proxy.manager import proxy_manager
 logger = logging.getLogger("zenlite.providers")
 
 
+def merge_extra_fields(
+    payload: dict,
+    extra_body: Optional[dict] = None,
+    protected: tuple = ("model", "messages", "stream"),
+) -> dict:
+    """Merge client passthrough fields into the payload.
+
+    `protected` keys are controlled by ZenLite (the client's model is
+    prefix-stripped, messages are validated, stream is set by the router)
+    and are never overridden by the passthrough body. Everything else the
+    client sent — `tools`, `tool_choice`, `functions`, `function_call`,
+    `response_format`, `stream_options`, `seed`, ... — is forwarded verbatim
+    so the gateway is a fully transparent OpenAI-compatible proxy.
+    """
+    for key, value in (extra_body or {}).items():
+        if key not in protected and value is not None:
+            payload[key] = value
+    return payload
+
+
 class BaseProvider(ABC):
     """
     Abstract base for upstream AI providers.
@@ -116,7 +136,10 @@ class BaseProvider(ABC):
                             logger.debug("Could not parse JSON line: %s", line)
             finally:
                 await response.aclose()
-                await client.aclose()
+                # Direct-path streams use the shared proxy_manager client;
+                # only per-attempt proxy clients need closing here.
+                if client is not None:
+                    await client.aclose()
 
     # ── Abstract Methods ──────────────────────────────────────────────────
 

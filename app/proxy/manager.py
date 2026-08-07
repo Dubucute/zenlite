@@ -7,13 +7,14 @@ If ALL proxies fail, retry the entire pool once more.
 
 import asyncio
 import random
+import threading
 import time
 import logging
 from typing import Optional
 
 import httpx
 
-from app.config import SOCKS5_PROXIES, FREE_PROXY_REFRESH_INTERVAL, fetch_free_proxies
+from app.config import SOCKS5_PROXIES, FREE_PROXY_REFRESH_INTERVAL, fetch_free_proxies, USE_FREE_PROXIES
 
 logger = logging.getLogger("zenlite.proxy")
 
@@ -45,6 +46,11 @@ class ProxyManager:
         self._current_index: int = 0
         self._lock = asyncio.Lock()
         self._refresh_task: Optional[asyncio.Task] = None
+        # Shared client for the direct path: keep-alive + connection pooling
+        # avoid paying a fresh TLS handshake on every request. Proxy fallback
+        # attempts still use per-attempt clients (lazily closed).
+        self._direct_client: Optional[httpx.AsyncClient] = None
+        self._client_lock = threading.Lock()
         # Stats
         self.stats = {
             "total_requests": 0,
@@ -59,8 +65,10 @@ class ProxyManager:
 
     @property
     def _proxy_pool(self) -> list[str]:
-        """Combined pool: IPVanish first, then free proxies."""
-        return self._ipvanish_pool + self._free_pool
+        """Combined pool: IPVanish first, then free proxies (if enabled)."""
+        if USE_FREE_PROXIES:
+            return self._ipvanish_pool + self._free_pool
+        return list(self._ipvanish_pool)
 
     def _next_proxy(self) -> str:
         """Get the next proxy from the pool (round-robin across all)."""
@@ -83,6 +91,34 @@ class ProxyManager:
             return proxy_url.split("@")[1].split(":")[0]
         return proxy_url.split("://")[1].split(":")[0]
 
+    def start(self):
+        """Create the shared direct-path client eagerly. Call once at app
+        startup so the client is bound to the server's event loop and the
+        first request doesn't pay client-construction cost."""
+        self._get_direct_client()
+
+    def _get_direct_client(self) -> httpx.AsyncClient:
+        """Return the shared direct-path client, creating it if needed."""
+        if self._direct_client is not None and not self._direct_client.is_closed:
+            return self._direct_client
+        # Lock-guarded: only the constructor (sync) runs inside, so a plain
+        # threading.Lock is safe and prevents two concurrent first requests
+        # from creating orphaned clients.
+        with self._client_lock:
+            if self._direct_client is None or self._direct_client.is_closed:
+                self._direct_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(120.0),
+                    follow_redirects=True,
+                    limits=httpx.Limits(max_connections=128, max_keepalive_connections=32),
+                )
+        return self._direct_client
+
+    async def aclose(self):
+        """Close the shared direct client. Call on application shutdown."""
+        if self._direct_client is not None and not self._direct_client.is_closed:
+            await self._direct_client.aclose()
+        self._direct_client = None
+
     def get_stats(self) -> dict:
         """Return current proxy rotation stats."""
         stats = {**self.stats}
@@ -94,6 +130,9 @@ class ProxyManager:
     # ── Free Proxy Refresh ───────────────────────────────────────────────
     async def refresh_proxies(self):
         """Download free proxies and merge into the pool."""
+        if not USE_FREE_PROXIES:
+            logger.info("Free proxies disabled by config; skipping refresh")
+            return
         free = await fetch_free_proxies()
         if free:
             self._free_pool = free
@@ -118,6 +157,9 @@ class ProxyManager:
 
     def start_refresh_task(self):
         """Start the background proxy refresh task."""
+        if not USE_FREE_PROXIES:
+            logger.info("Free proxy refresh disabled by config; not starting background task")
+            return
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(self._refresh_loop())
             logger.info("Started free proxy refresh task (every %ds)", FREE_PROXY_REFRESH_INTERVAL)
@@ -259,25 +301,26 @@ class ProxyManager:
         last_error: Optional[Exception] = None
         pool_size = len(self._proxy_pool)
 
-        # ── Step 1: Direct connection ────────────────────────────────────
+        # ── Step 1: Direct connection (shared keep-alive client) ────────
         try:
-            async with httpx.AsyncClient(
+            client = self._get_direct_client()
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_body,
                 timeout=httpx.Timeout(timeout),
-                follow_redirects=True,
-            ) as client:
-                response = await client.request(
-                    method=method, url=url, headers=headers, json=json_body,
-                )
-                if response.status_code in self.RETRYABLE_STATUSES:
-                    last_error = Exception(f"Direct request returned {response.status_code}")
-                    logger.warning("Direct rate-limited/error (status=%d), rotating...", response.status_code)
-                    self.stats["rate_limited_retries"] += 1
-                elif response.status_code < 400:
-                    self.stats["direct_successes"] += 1
-                    return response
-                else:
-                    last_error = Exception(f"Direct request returned {response.status_code}")
-                    logger.warning("Direct failed: status=%d", response.status_code)
+            )
+            if response.status_code in self.RETRYABLE_STATUSES:
+                last_error = Exception(f"Direct request returned {response.status_code}")
+                logger.warning("Direct rate-limited/error (status=%d), rotating...", response.status_code)
+                self.stats["rate_limited_retries"] += 1
+            elif response.status_code < 400:
+                self.stats["direct_successes"] += 1
+                return response
+            else:
+                last_error = Exception(f"Direct request returned {response.status_code}")
+                logger.warning("Direct failed: status=%d", response.status_code)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
             last_error = e
             logger.warning("Direct failed: %s", type(e).__name__)
@@ -311,36 +354,42 @@ class ProxyManager:
         """
         Execute a streaming HTTP request with proxy rotation fallback + retry.
 
-        Yields (response, proxy_url, client) tuples.
+        Yields (response, proxy_url, client) tuples. For the direct path
+        `client` is None (shared keep-alive client — close the response but
+        not the client); proxy attempts yield their per-attempt client.
         """
         self.stats["total_requests"] += 1
         last_error: Optional[Exception] = None
         pool_size = len(self._proxy_pool)
 
-        # ── Step 1: Direct connection ────────────────────────────────────
+        # ── Step 1: Direct connection (shared keep-alive client) ────────
+        # Note: for the direct path `client` is yielded as None — the caller
+        # must close the response but NOT the shared client. Proxy attempts
+        # yield their per-attempt client for the caller to close.
         try:
-            client = httpx.AsyncClient(
+            client = self._get_direct_client()
+            # timeout is set on the request (build_request), not on send() —
+            # send() does not accept a timeout kwarg in current httpx.
+            request = client.build_request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_body,
                 timeout=httpx.Timeout(timeout),
-                follow_redirects=True,
             )
-            response = await client.send(
-                client.build_request(method=method, url=url, headers=headers, json=json_body),
-                stream=True,
-            )
+            response = await client.send(request, stream=True)
             if response.status_code in self.RETRYABLE_STATUSES:
                 last_error = Exception(f"Direct stream returned {response.status_code}")
                 self.stats["rate_limited_retries"] += 1
                 await response.aclose()
-                await client.aclose()
                 logger.warning("Direct stream error (status=%d), rotating...", response.status_code)
             elif response.status_code < 400:
                 self.stats["direct_successes"] += 1
-                yield response, None, client
+                yield response, None, None
                 return
             else:
                 last_error = Exception(f"Direct stream returned {response.status_code}")
                 await response.aclose()
-                await client.aclose()
                 logger.warning("Direct stream failed: status=%d", response.status_code)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
             last_error = e

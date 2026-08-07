@@ -35,13 +35,16 @@ async def lifespan(app: FastAPI):
     logger.info("  API Base   → http://%s:%s/v1/", HOST, PORT)
     logger.info("═" * 60)
 
-    # Fetch free proxies on startup and start background refresh
+    # Create the shared direct-path client before serving, then fetch free
+    # proxies on startup and start the background refresh.
+    proxy_manager.start()
     await proxy_manager.refresh_proxies()
     proxy_manager.start_refresh_task()
 
     yield
 
     proxy_manager.stop_refresh_task()
+    await proxy_manager.aclose()
     logger.info("ZenLite shutting down.")
 
 

@@ -1,114 +1,65 @@
 """
 OpenAI-Compatible Chat Router
 Handles /v1/chat/completions with both streaming and non-streaming.
+
+ZenLite is a transparent OpenAI-compatible gateway: the full client request
+body (tools, tool_choice, functions, stream_options, ...) is forwarded
+verbatim to the upstream (OpenCode Zen by default), so tool-calling clients
+like GitHub Copilot agent mode work end-to-end.
 """
 
 import json
+import logging
 import time
 import uuid
-import logging
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
-from app.config import PROVIDERS, strip_model_prefix
-from app.providers.opencode_free import opencode_free_provider
-from app.providers.opencode_zen import opencode_zen_provider
+from app.config import PROVIDERS, RAW_MODELS, MODEL_ALIASES, strip_model_prefix
 from app.providers.base import UpstreamError
 
 logger = logging.getLogger("zenlite.router")
 
 router = APIRouter(prefix="/v1", tags=["OpenAI-Compatible"])
 
-
-# ── Request / Response Models ────────────────────────────────────────────────
-
-class ChatMessage(BaseModel):
-    role: str
-    content: Optional[str] = None
-    name: Optional[str] = None
+# ZenLite-specific request fields that are never forwarded upstream
+ZENLITE_ONLY_FIELDS = {"provider"}
 
 
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    stream: bool = False
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    top_p: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    presence_penalty: Optional[float] = None
-    stop: Optional[list[str]] = None
-    n: Optional[int] = None
-    # ZenLite-specific: which provider to use
-    provider: Optional[str] = None  # "opencode_free" or "opencode_zen"
-
-
-class UsageInfo(BaseModel):
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-
-
-class ChatChoice(BaseModel):
-    index: int = 0
-    message: ChatMessage
-    finish_reason: Optional[str] = "stop"
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:12]}")
-    object: str = "chat.completion"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: list[ChatChoice]
-    usage: UsageInfo = Field(default_factory=UsageInfo)
-
-
-# ── Provider Selection Logic ─────────────────────────────────────────────────
+# ── Provider Selection ───────────────────────────────────────────────────────
 
 def get_provider(provider_name: Optional[str] = None, api_key: Optional[str] = None):
-    """
-    Determine which provider to use.
+    """Every request is handled by the OpenAI-compatible passthrough provider.
 
-    Priority:
-      1. Explicit provider field in request body
-      2. If api_key is provided → OpenCode Zen
-      3. Default → OpenCode Free (no auth)
+    The `provider` names are kept for compatibility and only differ in auth:
+      - "opencode_free" (default) — no API key required
+      - "opencode_zen" / "openai"  — API key required
     """
-    if provider_name:
-        if provider_name == "opencode_free":
-            return opencode_free_provider, None
-        elif provider_name == "opencode_zen":
-            if not api_key:
-                raise HTTPException(
-                    status_code=400,
-                    detail="opencode_zen provider requires an API key",
-                )
-            return opencode_zen_provider, api_key
-        else:
+    from app.providers.openai import openai_provider
+
+    if provider_name == "opencode_free":
+        return openai_provider, None
+    if provider_name in ("opencode_zen", "openai"):
+        if not api_key:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unknown provider: {provider_name}. Use 'opencode_free' or 'opencode_zen'.",
+                detail=f"{provider_name} provider requires an API key",
             )
-
-    # Auto-detect from API key
-    if api_key:
-        return opencode_zen_provider, api_key
-
-    # Default: free provider
-    return opencode_free_provider, None
+        return openai_provider, api_key
+    if provider_name is None:
+        return openai_provider, api_key  # auto-detect: key is optional
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown provider: {provider_name}. Use 'opencode_free', 'opencode_zen' or 'openai'.",
+    )
 
 
 # ── API Key Extraction ──────────────────────────────────────────────────────
 
 def extract_api_key(request: Request) -> Optional[str]:
-    """
-    Extract API key from Authorization header (Bearer token).
-    Returns None if not present (which is fine for free provider).
-    """
+    """Extract API key from the Authorization header (Bearer token)."""
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
@@ -118,11 +69,10 @@ def extract_api_key(request: Request) -> Optional[str]:
 # ── Models Endpoint ──────────────────────────────────────────────────────────
 
 @router.get("/models")
-async def list_models(request: Request):
+async def list_models():
     """List all available models across all providers."""
-    api_key = extract_api_key(request)
     models = []
-    for provider_id, provider_config in PROVIDERS.items():
+    for provider_config in PROVIDERS.values():
         for model_id in provider_config.models:
             models.append({
                 "id": model_id,
@@ -133,10 +83,7 @@ async def list_models(request: Request):
                 "root": model_id,
                 "parent": None,
             })
-    return {
-        "object": "list",
-        "data": models,
-    }
+    return {"object": "list", "data": models}
 
 
 # ── Chat Completions Endpoint ───────────────────────────────────────────────
@@ -146,74 +93,55 @@ async def chat_completions(request: Request):
     """
     OpenAI-compatible /v1/chat/completions endpoint.
 
-    Accepts both streaming and non-streaming requests.
-    Routes to the appropriate provider based on API key / provider field.
+    Accepts both streaming and non-streaming requests. The request body is
+    passed through to the upstream almost verbatim (only ZenLite-only fields
+    such as `provider` are removed, and the model prefix is stripped).
     """
-    # Parse request body
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # Extract fields
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body: expected an object")
+
     model = body.get("model", "deepseek-v4-flash-free")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    temperature = body.get("temperature")
-    max_tokens = body.get("max_tokens")
-    top_p = body.get("top_p")
-    frequency_penalty = body.get("frequency_penalty")
-    presence_penalty = body.get("presence_penalty")
-    stop = body.get("stop")
-    n = body.get("n")
     provider_name = body.get("provider")
 
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
-    # Get API key from header
     api_key = extract_api_key(request)
-
-    # Select provider
     provider, effective_key = get_provider(provider_name, api_key)
 
-    # Strip model prefix for upstream (oc/big-pickle → big-pickle)
+    # Resolve aliases (e.g. Copilot's default "gpt-4o") to a free model
+    model = MODEL_ALIASES.get(model, model)
+
+    # Strip the provider prefix so the upstream receives the raw model id
     upstream_model = strip_model_prefix(model)
 
-    logger.info(
-        "Chat request: model=%s → upstream=%s provider=%s stream=%s",
-        model,
-        upstream_model,
-        provider.config.id,
-        stream,
-    )
+    # Free-tier models never need (and reject) an API key — drop any key so
+    # clients like Copilot can send any dummy string and still work.
+    if model.startswith("oc/") or upstream_model in RAW_MODELS:
+        effective_key = None
+
+    # Everything the client sent, minus ZenLite-only fields, goes upstream
+    # verbatim — tools, tool_choice, stream_options, ... all pass through.
+    passthrough = {k: v for k, v in body.items() if k not in ZENLITE_ONLY_FIELDS}
+
+    logger.info("Chat request: model=%s → upstream=%s stream=%s", model, upstream_model, stream)
 
     # ── Non-Streaming ────────────────────────────────────────────────────
     if not stream:
         try:
-            result = await provider.chat_completion(
+            return await provider.chat_completion(
                 model=upstream_model,
                 messages=messages,
-                stream=False,
                 api_key=effective_key,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                top_p=top_p,
-                frequency_penalty=frequency_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop,
-                n=n,
+                extra_body=passthrough,
             )
-            # Return as-is if it's already a proper response, else wrap it
-            if isinstance(result, dict) and "choices" in result:
-                return result
-            # Wrap raw response
-            return ChatCompletionResponse(
-                model=model,
-                choices=[ChatChoice(
-                    message=ChatMessage(role="assistant", content=str(result))
-                )],
-            ).model_dump()
         except UpstreamError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail)
         except Exception as e:
@@ -230,23 +158,13 @@ async def chat_completions(request: Request):
                 model=upstream_model,
                 messages=messages,
                 api_key=effective_key,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                top_p=top_p,
-                frequency_penalty=frequency_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop,
-                n=n,
+                extra_body=passthrough,
             ):
                 # Ensure proper OpenAI streaming format
-                if "id" not in chunk:
-                    chunk["id"] = completion_id
-                if "object" not in chunk:
-                    chunk["object"] = "chat.completion.chunk"
-                if "created" not in chunk:
-                    chunk["created"] = created
-                if "model" not in chunk:
-                    chunk["model"] = model
+                chunk.setdefault("id", completion_id)
+                chunk.setdefault("object", "chat.completion.chunk")
+                chunk.setdefault("created", created)
+                chunk.setdefault("model", model)
 
                 yield f"data: {json.dumps(chunk)}\n\n"
 
@@ -254,10 +172,11 @@ async def chat_completions(request: Request):
         except Exception as e:
             logger.exception("Stream error")
             error_chunk = {
-                "error": {
-                    "message": str(e),
-                    "type": "provider_error",
-                }
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "error": {"message": str(e), "type": "provider_error"},
             }
             yield f"data: {json.dumps(error_chunk)}\n\n"
 
