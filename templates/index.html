@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <h1>ZenLite</h1>
+                <span class="version">v{{ version }}</span>
+            </div>
+            <div class="header-status">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </header>
+
+        <!-- Stats Bar -->
+        <div class="stats-bar">
+            <div class="stat-card">
+                <div class="stat-label">Uptime</div>
+                <div class="stat-value" id="uptime">—</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Requests</div>
+                <div class="stat-value" id="totalRequests">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Direct Hits</div>
+                <div class="stat-value" id="directHits">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Proxy Hits</div>
+                <div class="stat-value" id="proxyHits">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Rate Limit Retries</div>
+                <div class="stat-value" id="rateLimitRetries">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Retries (All Failed)</div>
+                <div class="stat-value" id="retries">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Proxy Failures</div>
+                <div class="stat-value" id="proxyFailures">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Failures</div>
+                <div class="stat-value" id="failures">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Proxy Pool</div>
+                <div class="stat-value" id="proxyPool">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Free Proxies</div>
+                <div class="stat-value" id="freeProxies">0</div>
+            </div>
+        </div>
+
+        <!-- Two Column Layout -->
+        <div class="main-grid">
+            <!-- Left: Providers -->
+            <div class="panel">
+                <h2>Providers</h2>
+                <div id="providersList" class="providers-list">Loading...</div>
+            </div>
+
+            <!-- Right: Quick Test -->
+            <div class="panel">
+                <h2>Quick Test</h2>
+                <div class="test-form">
+                    <div class="form-row">
+                        <label for="providerSelect">Provider</label>
+                        <select id="providerSelect">
+                            <option value="opencode_free">OpenCode Free (No Auth)</option>
+                            <option value="opencode_zen">OpenCode Zen (API Key)</option>
+                        </select>
+                    </div>
+                    <div class="form-row" id="apiKeyRow" style="display: none;">
+                        <label for="apiKeyInput">API Key</label>
+                        <input type="password" id="apiKeyInput" placeholder="Enter your OpenCode API key">
+                    </div>
+                    <div class="form-row">
+                        <label for="modelSelect">Model</label>
+                        <select id="modelSelect"></select>
+                    </div>
+                    <div class="form-row">
+                        <label for="messageInput">Message</label>
+                        <textarea id="messageInput" rows="3" placeholder="Type your message...">Hello! What model are you?</textarea>
+                    </div>
+                    <div class="form-row">
+                        <label for="streamToggle">
+                            <input type="checkbox" id="streamToggle" checked> Stream response
+                        </label>
+                    </div>
+                    <button class="btn-primary" id="sendBtn" onclick="sendTest()">Send Request</button>
+                </div>
+                <div class="test-output" id="testOutput">
+                    <div class="output-label">Response:</div>
+                    <pre id="responseText">—</pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- Models List -->
+        <div class="panel full-width">
+            <h2>Available Models</h2>
+            <div id="modelsList" class="models-grid">Loading...</div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>ZenLite AI Gateway — OpenAI-Compatible API at <code>/v1/chat/completions</code></p>
+            <p class="footer-links">
+                <a href="/docs" target="_blank">API Docs</a> ·
+                <a href="/redoc" target="_blank">ReDoc</a> ·
+                <a href="/dashboard/status" target="_blank">Status</a>
+            </p>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
