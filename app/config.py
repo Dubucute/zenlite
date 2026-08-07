@@ -13,7 +13,13 @@ logger = logging.getLogger("zenlite.config")
 
 # ── Server Settings ──────────────────────────────────────────────────────────
 HOST = os.getenv("ZENLITE_HOST", "127.0.0.1")
-PORT = int(os.getenv("ZENLITE_PORT", "8100"))
+# `PORT` is injected by platforms like Render; `ZENLITE_PORT` overrides locally.
+PORT = int(os.getenv("PORT", os.getenv("ZENLITE_PORT", "8100")))
+
+# Optional shared secret for public deployments. When set, every /v1/* request
+# must send `Authorization: Bearer <ZENLITE_API_KEY>`. Leave empty for open
+# access (local dev). The key is still stripped for free-tier models upstream.
+ZENLITE_API_KEY = os.getenv("ZENLITE_API_KEY", "")
 
 # ── OpenCode Base URL ────────────────────────────────────────────────────────
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"

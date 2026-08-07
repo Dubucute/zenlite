@@ -217,7 +217,10 @@ class ProxyManager:
                         last_error = Exception(f"Proxy {proxy_label} returned {response.status_code}")
                         self.stats["proxy_failures"] += 1
                         logger.warning("Proxy %s failed: status=%d", proxy_label, response.status_code)
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
+            except Exception as e:
+                # Any failure (timeouts, connect errors, and third-party quirks
+                # like socksio's malformed-reply crash) counts as a proxy
+                # failure so rotation continues to the next proxy.
                 last_error = e
                 self.stats["proxy_failures"] += 1
                 logger.warning("Proxy %s failed: %s", proxy_label, type(e).__name__)
@@ -273,7 +276,10 @@ class ProxyManager:
                     await response.aclose()
                     await client.aclose()
                     logger.warning("Proxy stream %s failed: status=%d", proxy_label, response.status_code)
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
+            except Exception as e:
+                # Any failure (timeouts, connect errors, and third-party quirks
+                # like socksio's malformed-reply crash) counts as a proxy
+                # failure so rotation continues to the next proxy.
                 last_error = e
                 self.stats["proxy_failures"] += 1
                 logger.warning("Proxy stream %s failed: %s", proxy_label, type(e).__name__)

@@ -9,9 +9,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.config import HOST, PORT, DASHBOARD_TITLE, DASHBOARD_VERSION
+from app.config import HOST, PORT, DASHBOARD_TITLE, DASHBOARD_VERSION, ZENLITE_API_KEY
 from app.router.chat import router as chat_router
 from app.dashboard.routes import router as dashboard_router
 from app.proxy.manager import proxy_manager
@@ -64,6 +64,18 @@ templates = Jinja2Templates(directory="templates")
 # Register routers
 app.include_router(chat_router)
 app.include_router(dashboard_router)
+
+
+# ── Optional Gateway Auth ────────────────────────────────────────────────────
+@app.middleware("http")
+async def gateway_auth(request: Request, call_next):
+    """When ZENLITE_API_KEY is set, require `Authorization: Bearer <key>` on
+    all /v1/* routes. Off (open access) when the env var is empty."""
+    if ZENLITE_API_KEY and request.url.path.startswith("/v1/"):
+        auth = request.headers.get("authorization", "")
+        if auth.strip() != f"Bearer {ZENLITE_API_KEY}":
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 # ── Root → Dashboard ────────────────────────────────────────────────────────

@@ -59,4 +59,27 @@ ZENLITE_HOST=0.0.0.0 ZENLITE_WORKERS=4 python run.py
 - Run behind a reverse proxy (nginx/Caddy) for TLS.
 
 Environment variables: `ZENLITE_HOST`, `ZENLITE_PORT`, `ZENLITE_WORKERS`,
-`ZENLITE_RELOAD`.
+`ZENLITE_RELOAD`, `ZENLITE_API_KEY`.
+
+## Deploy to Render (free tier)
+
+1. Push this repo to GitHub, then in Render: **New → Web Service → connect
+   your repo**. Render picks up the `Dockerfile` automatically (or use the
+   native Python runtime, which reads the `Procfile`).
+2. Set environment variables:
+   - `ZENLITE_API_KEY` — a shared secret you'll use as Copilot's `apiKey`;
+     when set, `/v1/*` requires `Authorization: Bearer <key>`. Leave empty
+     to skip auth (not recommended for a public URL).
+   - `ZENLITE_WORKERS=1` (free tier has 512 MB — one worker is safest).
+3. Deploy. The service gets a `https://<name>.onrender.com` URL — use it as
+   Copilot's `url` with `apiKey` set to your `ZENLITE_API_KEY`.
+
+Free-tier caveats: the service **sleeps after ~15 min idle** and takes ~1
+min to wake, so keep it warm with a free uptime monitor (e.g. UptimeRobot)
+pinging `https://<name>.onrender.com/health` every 10 minutes.
+
+Local testing of the container:
+```bash
+docker build -t zenlite .
+docker run -p 8100:8100 -e ZENLITE_API_KEY=secret zenlite
+```
