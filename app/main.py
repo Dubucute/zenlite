@@ -19,7 +19,6 @@ from app.config import (
     DASHBOARD_VERSION,
     ZENLITE_API_KEY,
     OPENAI_BASE_URL,
-    USE_FREE_PROXIES,
 )
 from app.router.chat import router as chat_router
 from app.dashboard.routes import router as dashboard_router
@@ -49,25 +48,19 @@ async def lifespan(app: FastAPI):
         "ENABLED (ZENLITE_API_KEY set)" if ZENLITE_API_KEY else "disabled (open access)",
     )
     logger.info(
-        "  Proxies    : %s (%d IPVanish + %d free)",
-        "enabled" if USE_FREE_PROXIES else "IPVanish only",
+        "  Proxies    : %d IPVanish SOCKS5 (direct-first, rotate on 429 only)",
         len(proxy_manager._ipvanish_pool),
-        len(proxy_manager._free_pool),
     )
     logger.info("═" * 60)
 
     # Bridge ZenLite logs into the dashboard's live log viewer.
     install_log_bridge()
 
-    # Create the shared direct-path client before serving, then fetch free
-    # proxies on startup and start the background refresh.
+    # Create the shared direct-path client before serving.
     proxy_manager.start()
-    await proxy_manager.refresh_proxies()
-    proxy_manager.start_refresh_task()
 
     yield
 
-    proxy_manager.stop_refresh_task()
     await proxy_manager.aclose()
     logger.info("ZenLite shutting down.")
 

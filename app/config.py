@@ -4,7 +4,6 @@ Provider definitions, proxy settings, and app configuration.
 """
 
 import os
-import httpx
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -157,41 +156,18 @@ SOCKS5_PROXIES: list[str] = [
 ]
 
 
-# ── Free Proxy List (Proxifly) ──────────────────────────────────────────────
-# Auto-refreshing list of free proxies (SOCKS5 + HTTP + SOCKS4)
-FREE_PROXY_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
-FREE_PROXY_REFRESH_INTERVAL = 300  # seconds (5 minutes)
-
-
-async def fetch_free_proxies() -> list[str]:
-    """
-    Download and parse the free proxy list from Proxifly.
-    Returns a list of proxy URLs (socks5:// and http:// only, no socks4).
-    """
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(FREE_PROXY_URL)
-            resp.raise_for_status()
-            lines = resp.text.strip().splitlines()
-            # Filter: only socks5 and http proxies (skip socks4 — httpx needs socksio for it)
-            free = [
-                line.strip()
-                for line in lines
-                if line.strip() and (line.startswith("socks5://") or line.startswith("http://"))
-            ]
-            logger.info("Fetched %d free proxies from Proxifly", len(free))
-            return free
-    except Exception as e:
-        logger.warning("Failed to fetch free proxy list: %s", e)
-        return []
+# ── SOCKS5 pool override ────────────────────────────────────────────────────
+# Set the SOCKS5_PROXIES env var (comma-separated) to replace the default
+# IPVanish list without editing code — e.g. fresh IPVanish credentials or a
+# different SOCKS5 provider:
+#   SOCKS5_PROXIES="socks5://user:pass@mia.socks.ipvanish.com:1080,socks5://..."
+_ENV_SOCKS5 = os.getenv("SOCKS5_PROXIES", "").strip()
+if _ENV_SOCKS5:
+    SOCKS5_PROXIES = [p.strip() for p in _ENV_SOCKS5.split(",") if p.strip()]
+    logger.info("Using SOCKS5_PROXIES env override (%d proxies)", len(SOCKS5_PROXIES))
 
 
 # ── Dashboard Settings ───────────────────────────────────────────────────────
 DASHBOARD_TITLE = "ZenLite — AI Gateway"
 DASHBOARD_VERSION = "1.0.0"
-
-
-# Use free proxies from Proxifly when True. Set to False to force using only
-# the paid IPVanish SOCKS5 pool (recommended for reliability).
-USE_FREE_PROXIES = False
 

@@ -1,7 +1,7 @@
 """
 Proxy Rotation Manager
-Strategy: try DIRECT first, then rotate through SOCKS5 proxies on failure.
-Free proxies auto-refresh from Proxifly every 5 minutes.
+Strategy: try DIRECT first, then rotate through IPVanish SOCKS5 proxies
+ONLY when direct is rate-limited (429). No free proxies.
 If ALL proxies fail, retry the entire pool once more.
 """
 
@@ -14,7 +14,7 @@ from typing import Optional
 
 import httpx
 
-from app.config import SOCKS5_PROXIES, FREE_PROXY_REFRESH_INTERVAL, fetch_free_proxies, USE_FREE_PROXIES
+from app.config import SOCKS5_PROXIES
 
 logger = logging.getLogger("zenlite.proxy")
 
@@ -25,27 +25,37 @@ class ProxyManager:
 
     Flow per request:
       1. Attempt direct connection (no proxy)
-      2. On rate-limit (429), server error (5xx), timeout, connection error,
-         or any non-2xx → rotate to next proxy
-      3. Continue rotating through IPVanish SOCKS5, then free SOCKS5/HTTP proxies
-      4. If ALL proxies fail on first pass → retry the entire pool once more
-      5. Return first successful response or raise last error
+      2. If DIRECT is rate-limited (429) → rotate through the IPVanish SOCKS5 pool
+      3. If ALL proxies fail on first pass → retry the pool once more
+      4. Any NON-rate-limit direct failure (5xx, 4xx, timeout, connect error)
+         is returned/raised immediately — NO proxy rotation. Rotation exists
+         only to escape IP rate-limits.
+      5. Dead proxies get blacklisted: auth failures (401/403) for 24h,
+         other failures for 5 min — rotation never burns time on known-dead
+         proxies (e.g. expired IPVanish credentials returning 401).
 
     Proxy priority:
       1. IPVanish SOCKS5 (paid, reliable, with auth)
-      2. Free SOCKS5 from Proxifly (auto-refreshing, no auth)
-      3. Free HTTP from Proxifly (auto-refreshing, no auth)
     """
 
-    # HTTP status codes that trigger proxy rotation
+    # Direct-path statuses that trigger proxy rotation: ONLY rate-limiting.
+    # Anything else (5xx, 4xx, timeouts) is a non-proxy failure and is
+    # returned/raised as-is — never disguised as a proxy error.
+    DIRECT_ROTATE_STATUSES = {429}
+
+    # Proxy-internal statuses that mean "try the next proxy"
     RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+    # Blacklist durations: 401/403 = dead credentials (24h); everything else = 5 min cooldown
+    PROXY_BLACKLIST_AUTH_SECONDS = 24 * 3600
+    PROXY_BLACKLIST_FAIL_SECONDS = 300
 
     def __init__(self):
         self._ipvanish_pool: list[str] = list(SOCKS5_PROXIES)
-        self._free_pool: list[str] = []  # populated by refresh
         self._current_index: int = 0
         self._lock = asyncio.Lock()
-        self._refresh_task: Optional[asyncio.Task] = None
+        # Proxy blacklist: proxy URL -> cooldown-until (epoch seconds)
+        self._blacklist: dict[str, float] = {}
         # Shared client for the direct path: keep-alive + connection pooling
         # avoid paying a fresh TLS handshake on every request. Proxy fallback
         # attempts still use per-attempt clients (lazily closed).
@@ -60,24 +70,35 @@ class ProxyManager:
             "proxy_failures": 0,
             "retries": 0,
             "failures": 0,
-            "free_proxies_count": 0,
+            "blacklisted_proxies": 0,
         }
 
     @property
     def _proxy_pool(self) -> list[str]:
-        """Combined pool: IPVanish first, then free proxies (if enabled)."""
-        if USE_FREE_PROXIES:
-            return self._ipvanish_pool + self._free_pool
+        """The IPVanish SOCKS5 pool (direct path needs no proxy)."""
         return list(self._ipvanish_pool)
 
+    def _is_blacklisted(self, proxy_url: str) -> bool:
+        """True if the proxy is in cooldown/blacklist (skip it)."""
+        return self._blacklist.get(proxy_url, 0.0) > time.time()
+
+    def _blacklist_proxy(self, proxy_url: str, seconds: float):
+        """Put a proxy into cooldown for `seconds`."""
+        self._blacklist[proxy_url] = time.time() + seconds
+        self.stats["blacklisted_proxies"] = len(self._blacklist)
+        logger.info("Proxy %s blacklisted for %ds", self._proxy_label(proxy_url), int(seconds))
+
     def _next_proxy(self) -> str:
-        """Get the next proxy from the pool (round-robin across all)."""
+        """Get the next non-blacklisted proxy (round-robin across all)."""
         pool = self._proxy_pool
         if not pool:
             raise Exception("No proxies available")
-        proxy = pool[self._current_index % len(pool)]
-        self._current_index += 1
-        return proxy
+        for _ in range(len(pool)):
+            proxy = pool[self._current_index % len(pool)]
+            self._current_index += 1
+            if not self._is_blacklisted(proxy):
+                return proxy
+        raise Exception("All proxies are blacklisted (in cooldown)")
 
     def _build_proxy_map(self, proxy_url: Optional[str]):
         """Return an httpx-compatible proxy value for the given proxy URL."""
@@ -124,51 +145,8 @@ class ProxyManager:
         stats = {**self.stats}
         stats["pool_size"] = len(self._proxy_pool)
         stats["ipvanish_count"] = len(self._ipvanish_pool)
-        stats["free_proxies_count"] = len(self._free_pool)
+        stats["blacklisted_proxies"] = len(self._blacklist)
         return stats
-
-    # ── Free Proxy Refresh ───────────────────────────────────────────────
-    async def refresh_proxies(self):
-        """Download free proxies and merge into the pool."""
-        if not USE_FREE_PROXIES:
-            logger.info("Free proxies disabled by config; skipping refresh")
-            return
-        free = await fetch_free_proxies()
-        if free:
-            self._free_pool = free
-            self.stats["free_proxies_count"] = len(free)
-            logger.info(
-                "Proxy pool updated: %d IPVanish + %d free = %d total",
-                len(self._ipvanish_pool),
-                len(free),
-                len(self._ipvanish_pool) + len(free),
-            )
-        else:
-            logger.warning("Free proxy refresh returned empty, keeping existing pool")
-
-    async def _refresh_loop(self):
-        """Background loop that refreshes free proxies periodically."""
-        while True:
-            await asyncio.sleep(FREE_PROXY_REFRESH_INTERVAL)
-            try:
-                await self.refresh_proxies()
-            except Exception as e:
-                logger.error("Error during proxy refresh: %s", e)
-
-    def start_refresh_task(self):
-        """Start the background proxy refresh task."""
-        if not USE_FREE_PROXIES:
-            logger.info("Free proxy refresh disabled by config; not starting background task")
-            return
-        if self._refresh_task is None or self._refresh_task.done():
-            self._refresh_task = asyncio.create_task(self._refresh_loop())
-            logger.info("Started free proxy refresh task (every %ds)", FREE_PROXY_REFRESH_INTERVAL)
-
-    def stop_refresh_task(self):
-        """Stop the background proxy refresh task."""
-        if self._refresh_task and not self._refresh_task.done():
-            self._refresh_task.cancel()
-            logger.info("Stopped free proxy refresh task")
 
     # ── Single attempt through all proxies ───────────────────────────────
     async def _try_proxies(
@@ -211,19 +189,25 @@ class ProxyManager:
                         )
                     elif response.status_code < 400:
                         self.stats["proxy_successes"] += 1
+                        self._blacklist.pop(proxy_url, None)  # healthy again
                         logger.info("Proxy %s succeeded (status=%d)", proxy_label, response.status_code)
                         return response
                     else:
                         last_error = Exception(f"Proxy {proxy_label} returned {response.status_code}")
                         self.stats["proxy_failures"] += 1
-                        logger.warning("Proxy %s failed: status=%d", proxy_label, response.status_code)
+                        if response.status_code in (401, 403):
+                            self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
+                        else:
+                            self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
+                        logger.warning("Proxy %s failed: status=%d (blacklisted)", proxy_label, response.status_code)
             except Exception as e:
                 # Any failure (timeouts, connect errors, and third-party quirks
                 # like socksio's malformed-reply crash) counts as a proxy
                 # failure so rotation continues to the next proxy.
                 last_error = e
                 self.stats["proxy_failures"] += 1
-                logger.warning("Proxy %s failed: %s", proxy_label, type(e).__name__)
+                self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
+                logger.warning("Proxy %s failed: %s (blacklisted 5min)", proxy_label, type(e).__name__)
 
         raise last_error or Exception("All proxies failed")
 
@@ -261,12 +245,17 @@ class ProxyManager:
                     self.stats["rate_limited_retries"] += 1
                     await response.aclose()
                     await client.aclose()
+                    if response.status_code in (401, 403):
+                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
+                    else:
+                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
                     logger.warning(
                         "Proxy stream %s error (status=%d), trying next...",
                         proxy_label, response.status_code,
                     )
                 elif response.status_code < 400:
                     self.stats["proxy_successes"] += 1
+                    self._blacklist.pop(proxy_url, None)  # healthy again
                     logger.info("Proxy stream %s succeeded (status=%d)", proxy_label, response.status_code)
                     yield response, proxy_url, client
                     return
@@ -275,14 +264,19 @@ class ProxyManager:
                     self.stats["proxy_failures"] += 1
                     await response.aclose()
                     await client.aclose()
-                    logger.warning("Proxy stream %s failed: status=%d", proxy_label, response.status_code)
+                    if response.status_code in (401, 403):
+                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
+                    else:
+                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
+                    logger.warning("Proxy stream %s failed: status=%d (blacklisted)", proxy_label, response.status_code)
             except Exception as e:
                 # Any failure (timeouts, connect errors, and third-party quirks
                 # like socksio's malformed-reply crash) counts as a proxy
                 # failure so rotation continues to the next proxy.
                 last_error = e
                 self.stats["proxy_failures"] += 1
-                logger.warning("Proxy stream %s failed: %s", proxy_label, type(e).__name__)
+                self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
+                logger.warning("Proxy stream %s failed: %s (blacklisted 5min)", proxy_label, type(e).__name__)
 
         raise last_error or Exception("All proxy streams failed")
 
@@ -306,6 +300,8 @@ class ProxyManager:
         self.stats["total_requests"] += 1
         last_error: Optional[Exception] = None
         pool_size = len(self._proxy_pool)
+        direct_response: Optional[httpx.Response] = None
+        direct_limited = False
 
         # ── Step 1: Direct connection (shared keep-alive client) ────────
         try:
@@ -317,36 +313,49 @@ class ProxyManager:
                 json=json_body,
                 timeout=httpx.Timeout(timeout),
             )
-            if response.status_code in self.RETRYABLE_STATUSES:
-                last_error = Exception(f"Direct request returned {response.status_code}")
-                logger.warning("Direct rate-limited/error (status=%d), rotating...", response.status_code)
-                self.stats["rate_limited_retries"] += 1
-            elif response.status_code < 400:
+            if response.status_code < 400:
                 self.stats["direct_successes"] += 1
                 return response
+            if response.status_code in self.DIRECT_ROTATE_STATUSES:
+                direct_limited = True
+                direct_response = response
+                self.stats["rate_limited_retries"] += 1
+                logger.warning("Direct rate-limited (status=%d), rotating through proxies...", response.status_code)
             else:
-                last_error = Exception(f"Direct request returned {response.status_code}")
-                logger.warning("Direct failed: status=%d", response.status_code)
+                # Non-rate-limit failure (5xx/4xx): return the upstream error
+                # as-is. No proxy rotation — this is not a proxy problem.
+                self.stats["failures"] += 1
+                logger.warning("Direct failed: status=%d (not rate-limit; returning as-is, no proxy retry)", response.status_code)
+                return response
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
-            last_error = e
-            logger.warning("Direct failed: %s", type(e).__name__)
+            # Timeouts/connect errors are not rate-limits: surface immediately.
+            self.stats["failures"] += 1
+            logger.warning("Direct failed: %s (not rate-limit; no proxy retry)", type(e).__name__)
+            raise e
 
-        # ── Step 2: Try all proxies ─────────────────────────────────────
+        # ── Step 2: Rotate through proxies (only reached on direct 429) ─
         try:
             return await self._try_proxies(method, url, headers, json_body, timeout, pool_size)
         except Exception as e:
             last_error = e
 
-        # ── Step 3: RETRY — try all proxies again ───────────────────────
-        logger.warning("All %d proxies failed, retrying entire pool...", pool_size)
+        # ── Step 3: RETRY the pool once more ────────────────────────────
+        logger.warning("All %d proxies failed, retrying pool once more...", pool_size)
         self.stats["retries"] += 1
         try:
             return await self._try_proxies(method, url, headers, json_body, timeout, pool_size)
         except Exception as e:
             last_error = e
 
-        # All exhausted
+        # All exhausted — surface the ORIGINAL direct error (the 429), never
+        # a misleading generic proxy error.
         self.stats["failures"] += 1
+        if direct_response is not None:
+            logger.warning(
+                "Rotation exhausted (%d proxies, %d proxy failures); returning original direct status=%d",
+                pool_size, self.stats["proxy_failures"], direct_response.status_code,
+            )
+            return direct_response
         raise last_error or Exception("All direct + proxy connections failed (after retry)")
 
     async def execute_stream(
@@ -367,6 +376,7 @@ class ProxyManager:
         self.stats["total_requests"] += 1
         last_error: Optional[Exception] = None
         pool_size = len(self._proxy_pool)
+        direct_limited = False
 
         # ── Step 1: Direct connection (shared keep-alive client) ────────
         # Note: for the direct path `client` is yielded as None — the caller
@@ -384,24 +394,35 @@ class ProxyManager:
                 timeout=httpx.Timeout(timeout),
             )
             response = await client.send(request, stream=True)
-            if response.status_code in self.RETRYABLE_STATUSES:
-                last_error = Exception(f"Direct stream returned {response.status_code}")
-                self.stats["rate_limited_retries"] += 1
-                await response.aclose()
-                logger.warning("Direct stream error (status=%d), rotating...", response.status_code)
-            elif response.status_code < 400:
+            if response.status_code < 400:
                 self.stats["direct_successes"] += 1
                 yield response, None, None
                 return
-            else:
-                last_error = Exception(f"Direct stream returned {response.status_code}")
+            if response.status_code in self.DIRECT_ROTATE_STATUSES:
+                direct_limited = True
+                self.stats["rate_limited_retries"] += 1
                 await response.aclose()
-                logger.warning("Direct stream failed: status=%d", response.status_code)
+                logger.warning("Direct stream rate-limited (status=%d), rotating through proxies...", response.status_code)
+            else:
+                # Non-rate-limit failure: surface the upstream error immediately
+                # (no proxy rotation). Streaming can't return the response, so
+                # raise with the status + body — the caller yields an error chunk.
+                self.stats["failures"] += 1
+                body = ""
+                try:
+                    body = (await response.aread())[:200].decode("utf-8", "replace")
+                except Exception:
+                    pass
+                await response.aclose()
+                logger.warning("Direct stream failed: status=%d (not rate-limit; no proxy retry)", response.status_code)
+                raise RuntimeError(f"Upstream returned HTTP {response.status_code}: {body}")
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
-            last_error = e
-            logger.warning("Direct stream failed: %s", type(e).__name__)
+            # Timeouts/connect errors are not rate-limits: surface immediately.
+            self.stats["failures"] += 1
+            logger.warning("Direct stream failed: %s (not rate-limit; no proxy retry)", type(e).__name__)
+            raise e
 
-        # ── Step 2: Try all proxies ─────────────────────────────────────
+        # ── Step 2: Rotate through proxies (only reached on direct 429) ─
         try:
             async for item in self._try_proxies_stream(method, url, headers, json_body, timeout, pool_size):
                 yield item
@@ -409,8 +430,8 @@ class ProxyManager:
         except Exception as e:
             last_error = e
 
-        # ── Step 3: RETRY — try all proxies again ───────────────────────
-        logger.warning("All %d proxy streams failed, retrying entire pool...", pool_size)
+        # ── Step 3: RETRY the pool once more ────────────────────────────
+        logger.warning("All %d proxy streams failed, retrying pool once more...", pool_size)
         self.stats["retries"] += 1
         try:
             async for item in self._try_proxies_stream(method, url, headers, json_body, timeout, pool_size):
@@ -419,8 +440,13 @@ class ProxyManager:
         except Exception as e:
             last_error = e
 
-        # All exhausted
+        # All exhausted — surface the ORIGINAL reason (the direct 429),
+        # never a misleading generic proxy error.
         self.stats["failures"] += 1
+        if direct_limited:
+            raise RuntimeError(
+                f"Upstream rate-limited (429) and all {pool_size} rotation proxies failed"
+            )
         raise last_error or Exception("All direct + proxy stream connections failed (after retry)")
 
 
