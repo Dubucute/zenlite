@@ -113,6 +113,21 @@ async def chat_completions(request: Request):
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
+    # Upstream thinking-mode models (e.g. big-pickle) REQUIRE assistant
+    # tool_calls messages to echo `reasoning_content` back. When the last
+    # message is a tool result, a missing/empty field 400s with
+    # "The `reasoning_content` in the thinking mode must be passed back".
+    # Clients like Minis drop it, so inject an empty string — the upstream
+    # accepts any string value (null is rejected).
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and m.get("tool_calls")
+            and not isinstance(m.get("reasoning_content"), str)
+        ):
+            m["reasoning_content"] = ""
+
     api_key = extract_api_key(request)
     provider, effective_key = get_provider(provider_name, api_key)
 
