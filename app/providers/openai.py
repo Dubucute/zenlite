@@ -32,7 +32,13 @@ class OpenAIProvider(BaseProvider):
     def build_headers(self, api_key: Optional[str] = None) -> dict:
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "ZenLite/1.0",
+            # Browser-like UA: upstream sits behind Cloudflare and bot-detects
+            # non-browser clients, which triggers transient 403 block pages.
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
             "Accept": "text/event-stream",
         }
         if api_key:

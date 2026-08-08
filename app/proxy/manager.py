@@ -38,10 +38,11 @@ class ProxyManager:
       1. IPVanish SOCKS5 (paid, reliable, with auth)
     """
 
-    # Direct-path statuses that trigger proxy rotation: ONLY rate-limiting.
-    # Anything else (5xx, 4xx, timeouts) is a non-proxy failure and is
-    # returned/raised as-is — never disguised as a proxy error.
-    DIRECT_ROTATE_STATUSES = {429}
+    # Direct-path statuses that trigger proxy rotation: rate-limiting (429)
+    # and Cloudflare IP-blocks (403 with an HTML page). Anything else (5xx,
+    # JSON 4xx, timeouts) is a non-proxy failure and is returned/raised
+    # as-is — never disguised as a proxy error.
+    DIRECT_ROTATE_STATUSES = {429, 403}
 
     # Proxy-internal statuses that mean "try the next proxy"
     RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -81,6 +82,11 @@ class ProxyManager:
     def _is_blacklisted(self, proxy_url: str) -> bool:
         """True if the proxy is in cooldown/blacklist (skip it)."""
         return self._blacklist.get(proxy_url, 0.0) > time.time()
+
+    def _is_block_page(self, response) -> bool:
+        """True if the response is an HTML block/challenge page (Cloudflare)."""
+        ct = (response.headers.get("content-type") or "").lower()
+        return "text/html" in ct
 
     def _blacklist_proxy(self, proxy_url: str, seconds: float):
         """Put a proxy into cooldown for `seconds`."""
@@ -316,16 +322,21 @@ class ProxyManager:
             if response.status_code < 400:
                 self.stats["direct_successes"] += 1
                 return response
-            if response.status_code in self.DIRECT_ROTATE_STATUSES:
+            if response.status_code in self.DIRECT_ROTATE_STATUSES and (
+                response.status_code != 403 or self._is_block_page(response)
+            ):
                 direct_limited = True
                 direct_response = response
                 self.stats["rate_limited_retries"] += 1
-                logger.warning("Direct rate-limited (status=%d), rotating through proxies...", response.status_code)
+                logger.warning(
+                    "Direct rate-limited/blocked (status=%d), rotating through proxies...",
+                    response.status_code,
+                )
             else:
-                # Non-rate-limit failure (5xx/4xx): return the upstream error
-                # as-is. No proxy rotation — this is not a proxy problem.
+                # Non-rate-limit failure (5xx/4xx/JSON-403): return the upstream
+                # error as-is. No proxy rotation — this is not a proxy problem.
                 self.stats["failures"] += 1
-                logger.warning("Direct failed: status=%d (not rate-limit; returning as-is, no proxy retry)", response.status_code)
+                logger.warning("Direct failed: status=%d (not rate-limit/block; returning as-is, no proxy retry)", response.status_code)
                 return response
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
             # Timeouts/connect errors are not rate-limits: surface immediately.
@@ -351,11 +362,16 @@ class ProxyManager:
         # a misleading generic proxy error.
         self.stats["failures"] += 1
         if direct_response is not None:
-            logger.warning(
-                "Rotation exhausted (%d proxies, %d proxy failures); returning original direct status=%d",
-                pool_size, self.stats["proxy_failures"], direct_response.status_code,
+            if direct_response.status_code == 429:
+                logger.warning(
+                    "Rotation exhausted (%d proxies, %d proxy failures); returning original direct status=%d",
+                    pool_size, self.stats["proxy_failures"], direct_response.status_code,
+                )
+                return direct_response
+            # Cloudflare block page — never pass raw HTML through; raise a clear error
+            raise RuntimeError(
+                f"Upstream blocked the request (HTTP 403 - Cloudflare/IP block) and all {pool_size} rotation proxies failed"
             )
-            return direct_response
         raise last_error or Exception("All direct + proxy connections failed (after retry)")
 
     async def execute_stream(
@@ -377,6 +393,7 @@ class ProxyManager:
         last_error: Optional[Exception] = None
         pool_size = len(self._proxy_pool)
         direct_limited = False
+        direct_limited_status: Optional[int] = None
 
         # ── Step 1: Direct connection (shared keep-alive client) ────────
         # Note: for the direct path `client` is yielded as None — the caller
@@ -398,11 +415,14 @@ class ProxyManager:
                 self.stats["direct_successes"] += 1
                 yield response, None, None
                 return
-            if response.status_code in self.DIRECT_ROTATE_STATUSES:
+            if response.status_code in self.DIRECT_ROTATE_STATUSES and (
+                response.status_code != 403 or self._is_block_page(response)
+            ):
                 direct_limited = True
+                direct_limited_status = response.status_code
                 self.stats["rate_limited_retries"] += 1
                 await response.aclose()
-                logger.warning("Direct stream rate-limited (status=%d), rotating through proxies...", response.status_code)
+                logger.warning("Direct stream rate-limited/blocked (status=%d), rotating through proxies...", response.status_code)
             else:
                 # Non-rate-limit failure: surface the upstream error immediately
                 # (no proxy rotation). Streaming can't return the response, so
@@ -440,12 +460,12 @@ class ProxyManager:
         except Exception as e:
             last_error = e
 
-        # All exhausted — surface the ORIGINAL reason (the direct 429),
+        # All exhausted — surface the ORIGINAL reason (the direct 429/block),
         # never a misleading generic proxy error.
         self.stats["failures"] += 1
         if direct_limited:
             raise RuntimeError(
-                f"Upstream rate-limited (429) and all {pool_size} rotation proxies failed"
+                f"Upstream rate-limited/blocked (HTTP {direct_limited_status or 429}) and all {pool_size} rotation proxies failed"
             )
         raise last_error or Exception("All direct + proxy stream connections failed (after retry)")
 
