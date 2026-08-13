@@ -3,6 +3,14 @@ Proxy Rotation Manager
 Strategy: try DIRECT first, then rotate through IPVanish SOCKS5 proxies
 ONLY when direct is rate-limited (429). No free proxies.
 If ALL proxies fail, retry the entire pool once more.
+
+Blacklist policy (important):
+  - An HTTP status code (429/5xx/4xx) means the proxy CONNECTED and tunneled
+    fine — the status is the UPSTREAM's verdict, never blacklist for it.
+  - TRANSPORT faults (SOCKS handshake/auth failure, connect refused) prove
+    the proxy itself is dead -> blacklisted (auth 24h, others 5 min).
+  - Timeouts / read errors mean the upstream is slow (long contexts take
+    50s+) — proxy is innocent, never blacklisted.
 """
 
 import asyncio
@@ -50,6 +58,18 @@ class ProxyManager:
     # Blacklist durations: 401/403 = dead credentials (24h); everything else = 5 min cooldown
     PROXY_BLACKLIST_AUTH_SECONDS = 24 * 3600
     PROXY_BLACKLIST_FAIL_SECONDS = 300
+
+    # IMPORTANT: only TRANSPORT-level failures prove a proxy is dead.
+    # An HTTP status code means the proxy connected and tunneled fine —
+    # the status belongs to the UPSTREAM, never blacklist for it.
+    # ReadTimeout/ReadError mean the upstream is slow (long contexts take
+    # 50s+), not that the proxy failed — never blacklist those either.
+    TRANSPORT_FAULT_TYPES = (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ProxyError,
+        httpx.NetworkError,
+    )
 
     def __init__(self):
         self._ipvanish_pool: list[str] = list(SOCKS5_PROXIES)
@@ -187,10 +207,12 @@ class ProxyManager:
                         json=json_body,
                     )
                     if response.status_code in self.RETRYABLE_STATUSES:
+                        # Upstream busy (429/5xx). Proxy worked fine — just
+                        # move to the next proxy, do NOT blacklist.
                         last_error = Exception(f"Proxy {proxy_label} returned {response.status_code}")
                         self.stats["rate_limited_retries"] += 1
                         logger.warning(
-                            "Proxy %s error (status=%d), trying next...",
+                            "Proxy %s upstream status=%d, trying next...",
                             proxy_label, response.status_code,
                         )
                     elif response.status_code < 400:
@@ -199,21 +221,46 @@ class ProxyManager:
                         logger.info("Proxy %s succeeded (status=%d)", proxy_label, response.status_code)
                         return response
                     else:
+                        # 4xx from upstream through a WORKING proxy — the
+                        # proxy is fine; surface the upstream verdict.
                         last_error = Exception(f"Proxy {proxy_label} returned {response.status_code}")
                         self.stats["proxy_failures"] += 1
-                        if response.status_code in (401, 403):
-                            self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
-                        else:
-                            self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
-                        logger.warning("Proxy %s failed: status=%d (blacklisted)", proxy_label, response.status_code)
+                        logger.warning(
+                            "Proxy %s upstream status=%d (proxy OK, returning as-is)",
+                            proxy_label, response.status_code,
+                        )
+                        raise last_error
             except Exception as e:
-                # Any failure (timeouts, connect errors, and third-party quirks
-                # like socksio's malformed-reply crash) counts as a proxy
-                # failure so rotation continues to the next proxy.
+                # Only TRANSPORT faults prove the proxy itself is dead
+                # (SOCKS handshake/auth failure, connect refused, no route).
+                # Timeouts / read errors mean the UPSTREAM is slow — the proxy
+                # is innocent and must NOT be blacklisted.
+                if isinstance(e, self.TRANSPORT_FAULT_TYPES):
+                    self.stats["proxy_failures"] += 1
+                    # SOCKS auth failure = dead credentials -> 24h; other
+                    # transport faults -> 5 min cooldown.
+                    is_auth = isinstance(e, httpx.ProxyError) and any(
+                        s in str(e).lower() for s in ("auth", "socks5", "handshake")
+                    )
+                    if is_auth:
+                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
+                    else:
+                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
+                    logger.warning(
+                        "Proxy %s transport failure: %s (blacklisted %ds)",
+                        proxy_label, type(e).__name__,
+                        self.PROXY_BLACKLIST_AUTH_SECONDS if is_auth else self.PROXY_BLACKLIST_FAIL_SECONDS,
+                    )
+                else:
+                    # Upstream slow / read timeout / protocol quirk: proxy is
+                    # fine, just try the next one — NO blacklist.
+                    logger.warning(
+                        "Proxy %s upstream slow/failed: %s (proxy NOT blacklisted)",
+                        proxy_label, type(e).__name__,
+                    )
                 last_error = e
-                self.stats["proxy_failures"] += 1
-                self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
-                logger.warning("Proxy %s failed: %s (blacklisted 5min)", proxy_label, type(e).__name__)
+                # continue to next proxy
+                continue
 
         raise last_error or Exception("All proxies failed")
 
@@ -247,16 +294,13 @@ class ProxyManager:
                 )
                 response = await client.send(request, stream=True)
                 if response.status_code in self.RETRYABLE_STATUSES:
+                    # Upstream busy — proxy worked, try next, NO blacklist.
                     last_error = Exception(f"Proxy stream {proxy_label} returned {response.status_code}")
                     self.stats["rate_limited_retries"] += 1
                     await response.aclose()
                     await client.aclose()
-                    if response.status_code in (401, 403):
-                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
-                    else:
-                        self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
                     logger.warning(
-                        "Proxy stream %s error (status=%d), trying next...",
+                        "Proxy stream %s upstream status=%d, trying next...",
                         proxy_label, response.status_code,
                     )
                 elif response.status_code < 400:
@@ -266,23 +310,41 @@ class ProxyManager:
                     yield response, proxy_url, client
                     return
                 else:
+                    # 4xx through a working proxy = upstream verdict, not ours.
                     last_error = Exception(f"Proxy stream {proxy_label} returned {response.status_code}")
                     self.stats["proxy_failures"] += 1
                     await response.aclose()
                     await client.aclose()
-                    if response.status_code in (401, 403):
+                    logger.warning(
+                        "Proxy stream %s upstream status=%d (proxy OK, returning as-is)",
+                        proxy_label, response.status_code,
+                    )
+                    raise last_error
+            except Exception as e:
+                # Transport faults = proxy is dead (blacklist). Timeouts/read
+                # errors = upstream slow (proxy innocent, keep going).
+                if isinstance(e, self.TRANSPORT_FAULT_TYPES):
+                    self.stats["proxy_failures"] += 1
+                    is_auth = isinstance(e, httpx.ProxyError) and any(
+                        s in str(e).lower() for s in ("auth", "socks5", "handshake")
+                    )
+                    if is_auth:
                         self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_AUTH_SECONDS)
                     else:
                         self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
-                    logger.warning("Proxy stream %s failed: status=%d (blacklisted)", proxy_label, response.status_code)
-            except Exception as e:
-                # Any failure (timeouts, connect errors, and third-party quirks
-                # like socksio's malformed-reply crash) counts as a proxy
-                # failure so rotation continues to the next proxy.
+                    logger.warning(
+                        "Proxy stream %s transport failure: %s (blacklisted %ds)",
+                        proxy_label, type(e).__name__,
+                        self.PROXY_BLACKLIST_AUTH_SECONDS if is_auth else self.PROXY_BLACKLIST_FAIL_SECONDS,
+                    )
+                else:
+                    logger.warning(
+                        "Proxy stream %s upstream slow/failed: %s (proxy NOT blacklisted)",
+                        proxy_label, type(e).__name__,
+                    )
                 last_error = e
-                self.stats["proxy_failures"] += 1
-                self._blacklist_proxy(proxy_url, self.PROXY_BLACKLIST_FAIL_SECONDS)
-                logger.warning("Proxy stream %s failed: %s (blacklisted 5min)", proxy_label, type(e).__name__)
+                # continue to next proxy
+                continue
 
         raise last_error or Exception("All proxy streams failed")
 
