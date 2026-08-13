@@ -135,14 +135,16 @@ PROXY_PASS = "CIfYtdMDe0"
 PROXY_PORT = 1080
 
 SOCKS5_PROXIES: list[str] = [
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@au.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@ca.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@it.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@nl.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@pl.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@sg.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@es.socks.ipvanish.com:{PROXY_PORT}",
-    f"socks5://{PROXY_USER}:{PROXY_PASS}@gb.socks.ipvanish.com:{PROXY_PORT}",
+    # International (verified live: all return 200 with real egress IPs)
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@mel.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@tor.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@lin.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@ams.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@waw.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@sin.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@mad.socks.ipvanish.com:{PROXY_PORT}",
+    f"socks5://{PROXY_USER}:{PROXY_PASS}@lon.socks.ipvanish.com:{PROXY_PORT}",
+    # US (verified live)
     f"socks5://{PROXY_USER}:{PROXY_PASS}@iad.socks.ipvanish.com:{PROXY_PORT}",
     f"socks5://{PROXY_USER}:{PROXY_PASS}@atl.socks.ipvanish.com:{PROXY_PORT}",
     f"socks5://{PROXY_USER}:{PROXY_PASS}@chi.socks.ipvanish.com:{PROXY_PORT}",
