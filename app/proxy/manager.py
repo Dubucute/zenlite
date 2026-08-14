@@ -27,6 +27,72 @@ from app.config import SOCKS5_PROXIES
 logger = logging.getLogger("zenlite.proxy")
 
 
+# ── socksio bytearray compat ────────────────────────────────────────────────
+# On Windows, asyncio's Proactor transport delivers `bytearray` chunks to
+# httpcore's SOCKS5 handshake, and socksio's `decode_address` — which is
+# `functools.lru_cache`d — cannot hash a bytearray, so every connect-reply
+# parse dies with "TypeError: unhashable type: 'bytearray'". uvicorn's dev
+# reload / multi-worker children run a Selector loop (bytes) and are fine;
+# single-worker no-reload runs (and the Dockerfile / Procfile `uvicorn` CMD)
+# run a Proactor loop and would lose proxy fallback entirely. Normalize the
+# bind address to `bytes` before handing it to the cached original.
+def _install_socksio_compat() -> None:
+    try:
+        import socksio.socks5 as _socks5
+        import socksio.utils as _utils
+    except ImportError:  # httpx installed without [socks]
+        return
+    if getattr(_utils.decode_address, "_zenlite_socksio_compat", False):
+        return
+    _original = _utils.decode_address
+
+    def _safe_decode(address_type, encoded_addr):
+        return _original(address_type, bytes(encoded_addr))
+
+    _safe_decode._zenlite_socksio_compat = True
+    _utils.decode_address = _safe_decode
+    # socks5.py binds the name at import time, so it must be patched too.
+    _socks5.decode_address = _safe_decode
+
+
+_install_socksio_compat()
+
+
+# ── Log helpers ──────────────────────────────────────────────────────────────
+# A bare "status=429" tells nobody why rotation is happening. Surface a short
+# snippet of the upstream error body so quota errors like
+# `FreeUsageLimitError: Rate limit exceeded...` are visible in the dashboard.
+# Never raise — logging must not break a request.
+
+def _response_snippet(response, limit: int = 160) -> str:
+    """Short snippet of an already-read (non-stream) upstream error body."""
+    try:
+        return (response.text or "")[:limit].replace("\n", " ")
+    except Exception:
+        return ""
+
+
+async def _stream_snippet(response, limit: int = 160) -> str:
+    """Read a streamed upstream error body (aread) and return a short snippet."""
+    try:
+        raw = (await response.aread())[:limit]
+        return raw.decode("utf-8", "replace").replace("\n", " ")
+    except Exception:
+        return ""
+
+
+class UpstreamStatusError(Exception):
+    """Raised when the upstream returns a definitive HTTP error through a
+    working proxy. The proxy tunneled fine — this is the upstream's verdict,
+    so rotation must stop and the status/body surface to the caller instead
+    of being swallowed and retried through the rest of the pool."""
+
+    def __init__(self, status_code: int, detail: str = ""):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Upstream returned HTTP {status_code}: {detail[:200]}")
+
+
 class ProxyManager:
     """
     Manages proxy rotation with a direct-first fallback strategy.
@@ -38,6 +104,8 @@ class ProxyManager:
       4. Any NON-rate-limit direct failure (5xx, 4xx, timeout, connect error)
          is returned/raised immediately — NO proxy rotation. Rotation exists
          only to escape IP rate-limits.
+      4b. A 4xx returned THROUGH a working proxy is the upstream's verdict —
+          surfaced immediately with its real status, no pool retry.
       5. Dead proxies get blacklisted: auth failures (401/403) for 24h,
          other failures for 5 min — rotation never burns time on known-dead
          proxies (e.g. expired IPVanish credentials returning 401).
@@ -62,13 +130,15 @@ class ProxyManager:
     # IMPORTANT: only TRANSPORT-level failures prove a proxy is dead.
     # An HTTP status code means the proxy connected and tunneled fine —
     # the status belongs to the UPSTREAM, never blacklist for it.
-    # ReadTimeout/ReadError mean the upstream is slow (long contexts take
-    # 50s+), not that the proxy failed — never blacklist those either.
+    # ReadTimeout/ReadError/WriteError mean the upstream is slow (long
+    # contexts take 50s+) or reset the stream — the proxy is innocent,
+    # never blacklist those either. Note: httpx's ReadError/WriteError/
+    # CloseError all subclass NetworkError, so NetworkError must NOT be
+    # listed here — only connect-level and proxy-level faults qualify.
     TRANSPORT_FAULT_TYPES = (
-        httpx.ConnectError,
-        httpx.ConnectTimeout,
-        httpx.ProxyError,
-        httpx.NetworkError,
+        httpx.ConnectError,    # connect refused / no route / DNS — proxy unreachable
+        httpx.ConnectTimeout,  # proxy not accepting connections
+        httpx.ProxyError,      # SOCKS handshake / auth failure — dead credentials
     )
 
     def __init__(self):
@@ -212,8 +282,9 @@ class ProxyManager:
                         last_error = Exception(f"Proxy {proxy_label} returned {response.status_code}")
                         self.stats["rate_limited_retries"] += 1
                         logger.warning(
-                            "Proxy %s upstream status=%d, trying next...",
+                            "Proxy %s upstream status=%d: %s, trying next...",
                             proxy_label, response.status_code,
+                            _response_snippet(response),
                         )
                     elif response.status_code < 400:
                         self.stats["proxy_successes"] += 1
@@ -222,14 +293,17 @@ class ProxyManager:
                         return response
                     else:
                         # 4xx from upstream through a WORKING proxy — the
-                        # proxy is fine; surface the upstream verdict.
-                        last_error = Exception(f"Proxy {proxy_label} returned {response.status_code}")
+                        # proxy is fine; surface the upstream verdict. Return
+                        # the response as-is (the caller's validate_response
+                        # turns it into an UpstreamError with the real
+                        # status). Do NOT keep rotating: every proxy hits the
+                        # same upstream, so the verdict won't change.
                         self.stats["proxy_failures"] += 1
                         logger.warning(
-                            "Proxy %s upstream status=%d (proxy OK, returning as-is)",
+                            "Proxy %s upstream status=%d (proxy OK, surfacing upstream verdict)",
                             proxy_label, response.status_code,
                         )
-                        raise last_error
+                        return response
             except Exception as e:
                 # Only TRANSPORT faults prove the proxy itself is dead
                 # (SOCKS handshake/auth failure, connect refused, no route).
@@ -297,11 +371,12 @@ class ProxyManager:
                     # Upstream busy — proxy worked, try next, NO blacklist.
                     last_error = Exception(f"Proxy stream {proxy_label} returned {response.status_code}")
                     self.stats["rate_limited_retries"] += 1
+                    snippet = await _stream_snippet(response)
                     await response.aclose()
                     await client.aclose()
                     logger.warning(
-                        "Proxy stream %s upstream status=%d, trying next...",
-                        proxy_label, response.status_code,
+                        "Proxy stream %s upstream status=%d: %s, trying next...",
+                        proxy_label, response.status_code, snippet,
                     )
                 elif response.status_code < 400:
                     self.stats["proxy_successes"] += 1
@@ -311,15 +386,26 @@ class ProxyManager:
                     return
                 else:
                     # 4xx through a working proxy = upstream verdict, not ours.
-                    last_error = Exception(f"Proxy stream {proxy_label} returned {response.status_code}")
+                    # Stop rotation and surface it immediately — the generic
+                    # handler below must NOT swallow it as a transport/upstream
+                    # fault and burn through the rest of the pool.
                     self.stats["proxy_failures"] += 1
+                    body = ""
+                    try:
+                        body = (await response.aread())[:500].decode("utf-8", "replace")
+                    except Exception:
+                        pass
                     await response.aclose()
                     await client.aclose()
                     logger.warning(
-                        "Proxy stream %s upstream status=%d (proxy OK, returning as-is)",
+                        "Proxy stream %s upstream status=%d (proxy OK, surfacing upstream verdict)",
                         proxy_label, response.status_code,
                     )
-                    raise last_error
+                    raise UpstreamStatusError(response.status_code, body)
+            except UpstreamStatusError:
+                # Upstream's definitive verdict through a working proxy —
+                # never retried, never blacklisted.
+                raise
             except Exception as e:
                 # Transport faults = proxy is dead (blacklist). Timeouts/read
                 # errors = upstream slow (proxy innocent, keep going).
@@ -391,8 +477,8 @@ class ProxyManager:
                 direct_response = response
                 self.stats["rate_limited_retries"] += 1
                 logger.warning(
-                    "Direct rate-limited/blocked (status=%d), rotating through proxies...",
-                    response.status_code,
+                    "Direct rate-limited/blocked (status=%d): %s, rotating through proxies...",
+                    response.status_code, _response_snippet(response),
                 )
             else:
                 # Non-rate-limit failure (5xx/4xx/JSON-403): return the upstream
@@ -409,6 +495,10 @@ class ProxyManager:
         # ── Step 2: Rotate through proxies (only reached on direct 429) ─
         try:
             return await self._try_proxies(method, url, headers, json_body, timeout, pool_size)
+        except UpstreamStatusError:
+            # Upstream verdict through a working proxy — surface it as-is,
+            # no pool retry (retrying can't change the upstream's answer).
+            raise
         except Exception as e:
             last_error = e
 
@@ -426,8 +516,9 @@ class ProxyManager:
         if direct_response is not None:
             if direct_response.status_code == 429:
                 logger.warning(
-                    "Rotation exhausted (%d proxies, %d proxy failures); returning original direct status=%d",
+                    "Rotation exhausted (%d proxies, %d proxy failures); returning original direct status=%d: %s",
                     pool_size, self.stats["proxy_failures"], direct_response.status_code,
+                    _response_snippet(direct_response),
                 )
                 return direct_response
             # Cloudflare block page — never pass raw HTML through; raise a clear error
@@ -483,8 +574,12 @@ class ProxyManager:
                 direct_limited = True
                 direct_limited_status = response.status_code
                 self.stats["rate_limited_retries"] += 1
+                snippet = await _stream_snippet(response)
                 await response.aclose()
-                logger.warning("Direct stream rate-limited/blocked (status=%d), rotating through proxies...", response.status_code)
+                logger.warning(
+                    "Direct stream rate-limited/blocked (status=%d): %s, rotating through proxies...",
+                    response.status_code, snippet,
+                )
             else:
                 # Non-rate-limit failure: surface the upstream error immediately
                 # (no proxy rotation). Streaming can't return the response, so
@@ -509,6 +604,10 @@ class ProxyManager:
             async for item in self._try_proxies_stream(method, url, headers, json_body, timeout, pool_size):
                 yield item
                 return
+        except UpstreamStatusError:
+            # Upstream verdict through a working proxy — surface it as-is,
+            # no pool retry (retrying can't change the upstream's answer).
+            raise
         except Exception as e:
             last_error = e
 

@@ -1,8 +1,8 @@
 """
 OpenAI-Compatible Passthrough Provider
 
-ZenLite's single upstream provider. It fully handles the OpenAI protocol
-against `OPENAI_BASE_URL` (defaults to the OpenCode Zen endpoint): every
+ZenLite's single upstream provider: the no-auth OpenCode Free endpoint.
+It fully handles the OpenAI protocol against `OPENCODE_BASE_URL`: every
 field the client sends — `tools`, `tool_choice`, `functions`,
 `function_call`, `response_format`, `stream_options`, `seed`, ... — is
 forwarded verbatim, and upstream `tool_calls` (including streaming deltas)
@@ -24,10 +24,10 @@ from app.proxy.manager import proxy_manager
 
 
 class OpenAIProvider(BaseProvider):
-    """Fully OpenAI-compatible passthrough for an OpenAI-compatible endpoint."""
+    """Fully OpenAI-compatible passthrough for the no-auth OpenCode endpoint."""
 
     def __init__(self):
-        super().__init__(PROVIDERS["openai"])
+        super().__init__(PROVIDERS["opencode_free"])
 
     def build_headers(self, api_key: Optional[str] = None) -> dict:
         headers = {

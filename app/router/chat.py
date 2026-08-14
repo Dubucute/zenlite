@@ -31,29 +31,15 @@ ZENLITE_ONLY_FIELDS = {"provider"}
 # ── Provider Selection ───────────────────────────────────────────────────────
 
 def get_provider(provider_name: Optional[str] = None, api_key: Optional[str] = None):
-    """Every request is handled by the OpenAI-compatible passthrough provider.
+    """Every request is handled by the single no-auth OpenCode provider.
 
-    The `provider` names are kept for compatibility and only differ in auth:
-      - "opencode_free" (default) — no API key required
-      - "opencode_zen" / "openai"  — API key required
+    The `provider` field is accepted for backwards compatibility but is
+    ignored — ZenLite is a keyless gateway to OpenCode Free:
+      - "opencode_free" (default) / None / anything — no API key required
     """
     from app.providers.openai import openai_provider
 
-    if provider_name == "opencode_free":
-        return openai_provider, None
-    if provider_name in ("opencode_zen", "openai"):
-        if not api_key:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{provider_name} provider requires an API key",
-            )
-        return openai_provider, api_key
-    if provider_name is None:
-        return openai_provider, api_key  # auto-detect: key is optional
-    raise HTTPException(
-        status_code=400,
-        detail=f"Unknown provider: {provider_name}. Use 'opencode_free', 'opencode_zen' or 'openai'.",
-    )
+    return openai_provider, None
 
 
 # ── API Key Extraction ──────────────────────────────────────────────────────

@@ -18,7 +18,7 @@ from app.config import (
     DASHBOARD_TITLE,
     DASHBOARD_VERSION,
     ZENLITE_API_KEY,
-    OPENAI_BASE_URL,
+    OPENCODE_BASE_URL,
 )
 from app.router.chat import router as chat_router
 from app.dashboard.routes import router as dashboard_router
@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
     logger.info("  Listening on http://%s:%s", HOST, PORT)
     logger.info("  Dashboard  → http://%s:%s/", HOST, PORT)
     logger.info("  API Base   → http://%s:%s/v1/", HOST, PORT)
-    logger.info("  Upstream   → %s", OPENAI_BASE_URL)
+    logger.info("  Upstream   → %s", OPENCODE_BASE_URL)
     logger.info(
         "  Auth /v1/* : %s",
         "ENABLED (ZENLITE_API_KEY set)" if ZENLITE_API_KEY else "disabled (open access)",

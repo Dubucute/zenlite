@@ -22,10 +22,6 @@ ZENLITE_API_KEY = os.getenv("ZENLITE_API_KEY", "")
 
 # ── OpenCode Base URL ────────────────────────────────────────────────────────
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
-# Allow overriding the OpenAI base URL. Defaults to OPENCODE_BASE_URL so
-# clients that expect an OpenAI-compatible endpoint can be pointed at
-# OpenCode's custom implementation by setting `OPENAI_BASE_URL`.
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", OPENCODE_BASE_URL)
 
 
 # ── Provider Definitions ─────────────────────────────────────────────────────
@@ -54,9 +50,8 @@ RAW_MODELS = [
     "north-mini-code-free",
 ]
 
-# Model prefixes for each auth type
+# Model prefix for the no-auth OpenCode tier
 FREE_MODEL_PREFIX = "oc"        # oc/big-pickle
-ZEN_MODEL_PREFIX = "opencode"   # opencode/big-pickle
 
 
 def _prefixed_models(prefix: str, raw: list[str]) -> list[str]:
@@ -68,12 +63,10 @@ def strip_model_prefix(model: str) -> str:
     """
     Strip provider prefix from a model name and return the raw upstream model.
     'oc/big-pickle' → 'big-pickle'
-    'opencode/mimo-v2.5-free' → 'mimo-v2.5-free'
     'big-pickle' (no prefix) → 'big-pickle' (pass-through)
     """
-    for prefix in (FREE_MODEL_PREFIX, ZEN_MODEL_PREFIX):
-        if model.startswith(f"{prefix}/"):
-            return model[len(prefix) + 1 :]
+    if model.startswith(f"{FREE_MODEL_PREFIX}/"):
+        return model[len(FREE_MODEL_PREFIX) + 1 :]
     return model
 
 
@@ -107,22 +100,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         no_auth=True,
         description="Free, no authentication required. Models prefixed with oc/.",
         models=_prefixed_models(FREE_MODEL_PREFIX, RAW_MODELS),
-    ),
-    "opencode_zen": ProviderConfig(
-        id="opencode_zen",
-        name="OpenCode Zen",
-        base_url=f"{OPENCODE_BASE_URL}/chat/completions",
-        no_auth=False,
-        description="Requires an OpenCode API key. Models prefixed with opencode/.",
-        models=_prefixed_models(ZEN_MODEL_PREFIX, RAW_MODELS),
-    ),
-    "openai": ProviderConfig(
-        id="openai",
-        name="OpenAI",
-        base_url=f"{OPENAI_BASE_URL}/chat/completions",
-        no_auth=False,
-        description="OpenAI-compatible endpoint (defaults to OpenCode Zen). Handles all traffic with full tool-calling support.",
-        models=RAW_MODELS + list(MODEL_ALIASES),
     ),
 }
 
