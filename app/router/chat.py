@@ -4,8 +4,8 @@ Handles /v1/chat/completions with both streaming and non-streaming.
 
 ZenLite is a transparent OpenAI-compatible gateway: the full client request
 body (tools, tool_choice, functions, stream_options, ...) is forwarded
-verbatim to the upstream (OpenCode Zen by default), so tool-calling clients
-like GitHub Copilot agent mode work end-to-end.
+verbatim to the upstream (OpenCode Free), so tool-calling clients like GitHub
+Copilot agent mode work end-to-end.
 """
 
 import json
@@ -14,11 +14,13 @@ import time
 import uuid
 from typing import AsyncGenerator, Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import PROVIDERS, RAW_MODELS, MODEL_ALIASES, strip_model_prefix
 from app.providers.base import UpstreamError
+from app.proxy.manager import UpstreamVerdictError
 
 logger = logging.getLogger("zenlite.router")
 
@@ -123,11 +125,6 @@ async def chat_completions(request: Request):
     # Strip the provider prefix so the upstream receives the raw model id
     upstream_model = strip_model_prefix(model)
 
-    # Free-tier models never need (and reject) an API key — drop any key so
-    # clients like Copilot can send any dummy string and still work.
-    if model.startswith("oc/") or upstream_model in RAW_MODELS:
-        effective_key = None
-
     # Everything the client sent, minus ZenLite-only fields, goes upstream
     # verbatim — tools, tool_choice, stream_options, ... all pass through.
     passthrough = {k: v for k, v in body.items() if k not in ZENLITE_ONLY_FIELDS}
@@ -145,6 +142,11 @@ async def chat_completions(request: Request):
             )
         except UpstreamError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail)
+        except UpstreamVerdictError as e:
+            # Expected upstream verdict (quota exhausted, HTTP status, slow
+            # upstream) — surface cleanly, no traceback.
+            logger.warning("Upstream error relayed to client: %s", e)
+            raise HTTPException(status_code=502, detail=str(e))
         except Exception as e:
             logger.exception("Provider error")
             raise HTTPException(status_code=502, detail=f"Provider error: {str(e)}")
@@ -170,6 +172,20 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps(chunk)}\n\n"
 
             yield "data: [DONE]\n\n"
+        except (UpstreamVerdictError, httpx.TimeoutException) as e:
+            # Expected upstream verdicts (quota exhausted, HTTP status, slow
+            # upstream) — relay to the client as a warning, not a traceback.
+            logger.warning("Upstream error relayed to client: %s", e)
+            error_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "error": {"message": str(e), "type": "provider_error"},
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            # Terminate the stream so clients don't wait for more data.
+            yield "data: [DONE]\n\n"
         except Exception as e:
             logger.exception("Stream error")
             error_chunk = {
@@ -180,6 +196,8 @@ async def chat_completions(request: Request):
                 "error": {"message": str(e), "type": "provider_error"},
             }
             yield f"data: {json.dumps(error_chunk)}\n\n"
+            # Terminate the stream so clients don't wait for more data.
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         stream_generator(),

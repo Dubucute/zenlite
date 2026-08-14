@@ -1,7 +1,7 @@
 """opencode_client.py — simple CLI to call OpenCode via the OpenAI Python SDK.
 
 Uses the OpenAI SDK (v1+) with a client pointed at `OPENAI_BASE_URL`
-(defaults to OpenCode Zen). Supports tool-calling via `--tools`.
+(defaults to the OpenCode Free endpoint). Supports tool-calling via `--tools`.
 
 Usage examples:
   export OPENAI_API_KEY=sk-...

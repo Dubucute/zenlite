@@ -14,6 +14,7 @@ Blacklist policy (important):
 """
 
 import asyncio
+import json
 import random
 import threading
 import time
@@ -81,7 +82,38 @@ async def _stream_snippet(response, limit: int = 160) -> str:
         return ""
 
 
-class UpstreamStatusError(Exception):
+def _is_quota_exhausted(snippet: str) -> bool:
+    """True when an upstream 429 body is a quota error (FreeUsageLimitError)
+    rather than transient throttling — rotation against a drained quota is
+    mostly futile, so we cap how many proxies we probe."""
+    text = snippet.lower()
+    return "freeusagelimiterror" in text or "rate limit exceeded" in text
+
+
+def _extract_error_message(snippet: str) -> str:
+    """Pull the human-readable message out of an upstream error body so
+    client-facing errors don't embed raw nested JSON (which mangles SSE error
+    chunks and client displays). Falls back to the raw snippet."""
+    try:
+        data = json.loads(snippet)
+    except Exception:
+        return snippet
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        msg = err.get("message") or err.get("type")
+        if msg:
+            return str(msg)
+    return snippet
+
+
+class UpstreamVerdictError(RuntimeError):
+    """An EXPECTED upstream error — quota exhausted, an HTTP status verdict, a
+    slow upstream — that is relayed to the client. These are routine, so they
+    are logged at WARNING without a traceback; only unexpected failures get
+    ERROR-level logs."""
+
+
+class UpstreamStatusError(UpstreamVerdictError):
     """Raised when the upstream returns a definitive HTTP error through a
     working proxy. The proxy tunneled fine — this is the upstream's verdict,
     so rotation must stop and the status/body surface to the caller instead
@@ -106,6 +138,11 @@ class ProxyManager:
          only to escape IP rate-limits.
       4b. A 4xx returned THROUGH a working proxy is the upstream's verdict —
           surfaced immediately with its real status, no pool retry.
+      4c. A 429 whose body is a quota error (FreeUsageLimitError) probes only a
+          small sample of proxies, then surfaces the 429 — no full-pool sweep.
+      4d. Known-good proxies (recent successes, most recent first) are tried
+          before the round-robin pool — per-IP upstream quotas mean the last
+          winner is the most likely to win again; when it 429s, move on.
       5. Dead proxies get blacklisted: auth failures (401/403) for 24h,
          other failures for 5 min — rotation never burns time on known-dead
          proxies (e.g. expired IPVanish credentials returning 401).
@@ -123,9 +160,28 @@ class ProxyManager:
     # Proxy-internal statuses that mean "try the next proxy"
     RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
+    # When the upstream's 429 body reports quota exhaustion
+    # (FreeUsageLimitError), sweeping the whole pool twice (up to 36 upstream
+    # calls per client request) just amplifies the 429 storm. Per-IP quota
+    # buckets can still have room, so probe a small sample of proxies, then
+    # surface the upstream 429 as-is.
+    QUOTA_ROTATION_CAP = 6
+
+    # Backoff for 429 rate-limit bursts: small jittered sleep before trying
+    # the next proxy. This gives the upstream a chance to recover and avoids
+    # hammering it with a tight loop of 429s.
+    RATE_LIMIT_BACKOFF_BASE = 0.5
+    RATE_LIMIT_BACKOFF_MAX = 2.0
+
     # Blacklist durations: 401/403 = dead credentials (24h); everything else = 5 min cooldown
     PROXY_BLACKLIST_AUTH_SECONDS = 24 * 3600
     PROXY_BLACKLIST_FAIL_SECONDS = 300
+
+    # Known-good proxy memory: a proxy that recently succeeded is tried FIRST
+    # on the next rotation. Per-IP upstream quotas mean winners keep winning,
+    # but a winner that 429s now falls through to the next candidate.
+    GOOD_PROXY_MAX = 5
+    GOOD_PROXY_TTL = 300.0
 
     # IMPORTANT: only TRANSPORT-level failures prove a proxy is dead.
     # An HTTP status code means the proxy connected and tunneled fine —
@@ -144,9 +200,11 @@ class ProxyManager:
     def __init__(self):
         self._ipvanish_pool: list[str] = list(SOCKS5_PROXIES)
         self._current_index: int = 0
-        self._lock = asyncio.Lock()
         # Proxy blacklist: proxy URL -> cooldown-until (epoch seconds)
         self._blacklist: dict[str, float] = {}
+        # Known-good proxies: (proxy_url, last-success epoch), most recent
+        # first, capped. Tried before the round-robin pool during rotation.
+        self._good: list[tuple[str, float]] = []
         # Shared client for the direct path: keep-alive + connection pooling
         # avoid paying a fresh TLS handshake on every request. Proxy fallback
         # attempts still use per-attempt clients (lazily closed).
@@ -162,6 +220,7 @@ class ProxyManager:
             "retries": 0,
             "failures": 0,
             "blacklisted_proxies": 0,
+            "good_proxy_hits": 0,
         }
 
     @property
@@ -184,8 +243,39 @@ class ProxyManager:
         self.stats["blacklisted_proxies"] = len(self._blacklist)
         logger.info("Proxy %s blacklisted for %ds", self._proxy_label(proxy_url), int(seconds))
 
-    def _next_proxy(self) -> str:
-        """Get the next non-blacklisted proxy (round-robin across all)."""
+    def _mark_good(self, proxy_url: str) -> None:
+        """Record a proxy that just succeeded upstream. The most recent winner
+        is tried first on the next rotation; entries expire after the TTL."""
+        now = time.time()
+        self._good = [
+            (p, t) for p, t in self._good
+            if p != proxy_url and now - t < self.GOOD_PROXY_TTL
+        ]
+        self._good.insert(0, (proxy_url, now))
+        del self._good[self.GOOD_PROXY_MAX:]
+
+    def _good_queue(self) -> list[str]:
+        """Snapshot of known-good proxies (most recent first) to try before the
+        round-robin pool. Built once per rotation call so concurrent requests
+        each get their own queue — a shared cursor would let interleaved
+        rotations re-try the same proxy (duplicate 429s) or skip candidates.
+        """
+        now = time.time()
+        self._good = [(p, t) for p, t in self._good if now - t < self.GOOD_PROXY_TTL]
+        return [p for p, _ in self._good if not self._is_blacklisted(p)]
+
+    def _next_proxy(self, good_queue: Optional[list] = None) -> str:
+        """Get the next non-blacklisted proxy.
+
+        `good_queue` (a per-call snapshot from `_good_queue`) is drained first
+        — known-good proxies are the most likely to win again under per-IP
+        upstream quotas, and a winner that just got rate-limited falls through
+        to the next candidate. Once the queue is empty, fall back to
+        round-robin across the whole pool.
+        """
+        if good_queue:
+            self.stats["good_proxy_hits"] += 1
+            return good_queue.pop(0)
         pool = self._proxy_pool
         if not pool:
             raise Exception("No proxies available")
@@ -256,10 +346,11 @@ class ProxyManager:
     ) -> httpx.Response:
         """Try up to max_proxies proxies round-robin. Returns first success or raises."""
         last_error: Optional[Exception] = None
+        good_queue = self._good_queue()  # per-call snapshot (race-free)
 
         for _ in range(max_proxies):
             try:
-                proxy_url = self._next_proxy()
+                proxy_url = self._next_proxy(good_queue)
             except Exception:
                 break
             proxy_label = self._proxy_label(proxy_url)
@@ -286,9 +377,12 @@ class ProxyManager:
                             proxy_label, response.status_code,
                             _response_snippet(response),
                         )
+                        # Small jittered backoff to avoid hammering upstream
+                        await asyncio.sleep(random.uniform(self.RATE_LIMIT_BACKOFF_BASE, self.RATE_LIMIT_BACKOFF_MAX))
                     elif response.status_code < 400:
                         self.stats["proxy_successes"] += 1
                         self._blacklist.pop(proxy_url, None)  # healthy again
+                        self._mark_good(proxy_url)
                         logger.info("Proxy %s succeeded (status=%d)", proxy_label, response.status_code)
                         return response
                     else:
@@ -349,10 +443,11 @@ class ProxyManager:
     ):
         """Try up to max_proxies proxies for streaming. Yields (response, proxy_url, client) or raises."""
         last_error: Optional[Exception] = None
+        good_queue = self._good_queue()  # per-call snapshot (race-free)
 
         for _ in range(max_proxies):
             try:
-                proxy_url = self._next_proxy()
+                proxy_url = self._next_proxy(good_queue)
             except Exception:
                 break
             proxy_label = self._proxy_label(proxy_url)
@@ -378,9 +473,12 @@ class ProxyManager:
                         "Proxy stream %s upstream status=%d: %s, trying next...",
                         proxy_label, response.status_code, snippet,
                     )
+                    # Small jittered backoff to avoid hammering upstream
+                    await asyncio.sleep(random.uniform(self.RATE_LIMIT_BACKOFF_BASE, self.RATE_LIMIT_BACKOFF_MAX))
                 elif response.status_code < 400:
                     self.stats["proxy_successes"] += 1
                     self._blacklist.pop(proxy_url, None)  # healthy again
+                    self._mark_good(proxy_url)
                     logger.info("Proxy stream %s succeeded (status=%d)", proxy_label, response.status_code)
                     yield response, proxy_url, client
                     return
@@ -401,7 +499,9 @@ class ProxyManager:
                         "Proxy stream %s upstream status=%d (proxy OK, surfacing upstream verdict)",
                         proxy_label, response.status_code,
                     )
-                    raise UpstreamStatusError(response.status_code, body)
+                    raise UpstreamStatusError(
+                        response.status_code, _extract_error_message(body)
+                    )
             except UpstreamStatusError:
                 # Upstream's definitive verdict through a working proxy —
                 # never retried, never blacklisted.
@@ -455,7 +555,8 @@ class ProxyManager:
         last_error: Optional[Exception] = None
         pool_size = len(self._proxy_pool)
         direct_response: Optional[httpx.Response] = None
-        direct_limited = False
+        quota_exhausted = False
+        direct_snippet = ""
 
         # ── Step 1: Direct connection (shared keep-alive client) ────────
         try:
@@ -473,13 +574,17 @@ class ProxyManager:
             if response.status_code in self.DIRECT_ROTATE_STATUSES and (
                 response.status_code != 403 or self._is_block_page(response)
             ):
-                direct_limited = True
                 direct_response = response
                 self.stats["rate_limited_retries"] += 1
+                direct_snippet = _response_snippet(response)
+                quota_exhausted = _is_quota_exhausted(direct_snippet)
                 logger.warning(
-                    "Direct rate-limited/blocked (status=%d): %s, rotating through proxies...",
-                    response.status_code, _response_snippet(response),
+                    "Direct rate-limited/blocked (status=%d): %s, rotating through proxies...%s",
+                    response.status_code, direct_snippet,
+                    " (quota exhausted — capped rotation)" if quota_exhausted else "",
                 )
+                # Small backoff before proxy rotation to avoid immediate burst
+                await asyncio.sleep(random.uniform(self.RATE_LIMIT_BACKOFF_BASE, self.RATE_LIMIT_BACKOFF_MAX))
             else:
                 # Non-rate-limit failure (5xx/4xx/JSON-403): return the upstream
                 # error as-is. No proxy rotation — this is not a proxy problem.
@@ -493,8 +598,9 @@ class ProxyManager:
             raise e
 
         # ── Step 2: Rotate through proxies (only reached on direct 429) ─
+        max_proxies = min(pool_size, self.QUOTA_ROTATION_CAP) if quota_exhausted else pool_size
         try:
-            return await self._try_proxies(method, url, headers, json_body, timeout, pool_size)
+            return await self._try_proxies(method, url, headers, json_body, timeout, max_proxies)
         except UpstreamStatusError:
             # Upstream verdict through a working proxy — surface it as-is,
             # no pool retry (retrying can't change the upstream's answer).
@@ -502,7 +608,18 @@ class ProxyManager:
         except Exception as e:
             last_error = e
 
-        # ── Step 3: RETRY the pool once more ────────────────────────────
+        if quota_exhausted:
+            # Free-tier quota drained: a short probe is enough — burning the
+            # whole pool twice would turn one client request into dozens of
+            # upstream 429s. Surface the original direct verdict.
+            self.stats["failures"] += 1
+            logger.warning(
+                "Quota exhausted: %d proxies probed without success; returning direct status=%d: %s",
+                max_proxies, direct_response.status_code, direct_snippet,
+            )
+            return direct_response
+
+        # ── Step 3: RETRY the pool once more (transient throttling only) ─
         logger.warning("All %d proxies failed, retrying pool once more...", pool_size)
         self.stats["retries"] += 1
         try:
@@ -521,8 +638,9 @@ class ProxyManager:
                     _response_snippet(direct_response),
                 )
                 return direct_response
-            # Cloudflare block page — never pass raw HTML through; raise a clear error
-            raise RuntimeError(
+            # Cloudflare block page — never pass raw HTML through; raise a clear
+            # error (expected verdict, relayed without a traceback).
+            raise UpstreamVerdictError(
                 f"Upstream blocked the request (HTTP 403 - Cloudflare/IP block) and all {pool_size} rotation proxies failed"
             )
         raise last_error or Exception("All direct + proxy connections failed (after retry)")
@@ -547,6 +665,8 @@ class ProxyManager:
         pool_size = len(self._proxy_pool)
         direct_limited = False
         direct_limited_status: Optional[int] = None
+        quota_exhausted = False
+        snippet = ""
 
         # ── Step 1: Direct connection (shared keep-alive client) ────────
         # Note: for the direct path `client` is yielded as None — the caller
@@ -575,11 +695,15 @@ class ProxyManager:
                 direct_limited_status = response.status_code
                 self.stats["rate_limited_retries"] += 1
                 snippet = await _stream_snippet(response)
+                quota_exhausted = _is_quota_exhausted(snippet)
                 await response.aclose()
                 logger.warning(
-                    "Direct stream rate-limited/blocked (status=%d): %s, rotating through proxies...",
+                    "Direct stream rate-limited/blocked (status=%d): %s, rotating through proxies...%s",
                     response.status_code, snippet,
+                    " (quota exhausted — capped rotation)" if quota_exhausted else "",
                 )
+                # Small backoff before proxy rotation
+                await asyncio.sleep(random.uniform(self.RATE_LIMIT_BACKOFF_BASE, self.RATE_LIMIT_BACKOFF_MAX))
             else:
                 # Non-rate-limit failure: surface the upstream error immediately
                 # (no proxy rotation). Streaming can't return the response, so
@@ -592,7 +716,10 @@ class ProxyManager:
                     pass
                 await response.aclose()
                 logger.warning("Direct stream failed: status=%d (not rate-limit; no proxy retry)", response.status_code)
-                raise RuntimeError(f"Upstream returned HTTP {response.status_code}: {body}")
+                raise UpstreamVerdictError(
+                    f"Upstream returned HTTP {response.status_code}: "
+                    f"{_extract_error_message(body)}"
+                )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ConnectTimeout) as e:
             # Timeouts/connect errors are not rate-limits: surface immediately.
             self.stats["failures"] += 1
@@ -600,8 +727,9 @@ class ProxyManager:
             raise e
 
         # ── Step 2: Rotate through proxies (only reached on direct 429) ─
+        max_proxies = min(pool_size, self.QUOTA_ROTATION_CAP) if quota_exhausted else pool_size
         try:
-            async for item in self._try_proxies_stream(method, url, headers, json_body, timeout, pool_size):
+            async for item in self._try_proxies_stream(method, url, headers, json_body, timeout, max_proxies):
                 yield item
                 return
         except UpstreamStatusError:
@@ -611,13 +739,23 @@ class ProxyManager:
         except Exception as e:
             last_error = e
 
-        # ── Step 3: RETRY the pool once more ────────────────────────────
+        if quota_exhausted:
+            self.stats["failures"] += 1
+            raise UpstreamVerdictError(
+                f"Upstream quota exhausted (HTTP {direct_limited_status or 429}): "
+                f"{_extract_error_message(snippet)}"
+            )
+
+        # ── Step 3: RETRY the pool once more (transient throttling only) ─
         logger.warning("All %d proxy streams failed, retrying pool once more...", pool_size)
         self.stats["retries"] += 1
         try:
             async for item in self._try_proxies_stream(method, url, headers, json_body, timeout, pool_size):
                 yield item
                 return
+        except UpstreamStatusError:
+            # Upstream verdict through a working proxy — never retried further.
+            raise
         except Exception as e:
             last_error = e
 
@@ -625,7 +763,7 @@ class ProxyManager:
         # never a misleading generic proxy error.
         self.stats["failures"] += 1
         if direct_limited:
-            raise RuntimeError(
+            raise UpstreamVerdictError(
                 f"Upstream rate-limited/blocked (HTTP {direct_limited_status or 429}) and all {pool_size} rotation proxies failed"
             )
         raise last_error or Exception("All direct + proxy stream connections failed (after retry)")

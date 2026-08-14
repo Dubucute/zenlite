@@ -18,9 +18,13 @@ which the SDK cannot provide.
 import json
 from typing import Any, AsyncGenerator, Optional
 
+from faker import Faker
 from app.config import PROVIDERS
 from app.providers.base import BaseProvider, merge_extra_fields
 from app.proxy.manager import proxy_manager
+
+fake = Faker()
+Faker.seed(0)
 
 
 class OpenAIProvider(BaseProvider):
@@ -32,17 +36,11 @@ class OpenAIProvider(BaseProvider):
     def build_headers(self, api_key: Optional[str] = None) -> dict:
         headers = {
             "Content-Type": "application/json",
-            # Browser-like UA: upstream sits behind Cloudflare and bot-detects
-            # non-browser clients, which triggers transient 403 block pages.
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ),
+            # Randomize UA per request using Faker to avoid bot detection patterns
+            "User-Agent": fake.user_agent(),
             "Accept": "text/event-stream",
         }
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        # API key is always None for the no-auth OpenCode Free endpoint
         return headers
 
     def build_payload(

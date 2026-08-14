@@ -10,7 +10,7 @@ from typing import Optional, AsyncGenerator
 import httpx
 
 from app.config import ProviderConfig
-from app.proxy.manager import proxy_manager
+from app.proxy.manager import proxy_manager, _extract_error_message
 
 logger = logging.getLogger("zenlite.providers")
 
@@ -165,7 +165,9 @@ class BaseProvider(ABC):
     def validate_response(self, response: httpx.Response) -> None:
         """Validate upstream response. Raises on errors."""
         if response.status_code >= 400:
-            error_body = response.text[:500]
+            # Pull the human-readable message out of the upstream error body so
+            # client-facing errors don't embed raw nested JSON.
+            error_body = _extract_error_message(response.text[:500])
             raise UpstreamError(
                 status_code=response.status_code,
                 detail=error_body,

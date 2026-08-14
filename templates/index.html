@@ -81,12 +81,11 @@
                         <label for="providerSelect">Provider</label>
                         <select id="providerSelect">
                             <option value="opencode_free">OpenCode Free (No Auth)</option>
-                            <option value="opencode_zen">OpenCode Zen (API Key)</option>
                         </select>
                     </div>
-                    <div class="form-row" id="apiKeyRow" style="display: none;">
-                        <label for="apiKeyInput">API Key</label>
-                        <input type="password" id="apiKeyInput" placeholder="Enter your OpenCode API key">
+                    <div class="form-row" id="apiKeyRow">
+                        <label for="apiKeyInput">Gateway API Key (optional)</label>
+                        <input type="password" id="apiKeyInput" placeholder="Only if ZENLITE_API_KEY is set">
                     </div>
                     <div class="form-row">
                         <label for="modelSelect">Model</label>

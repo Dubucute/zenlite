@@ -15,12 +15,6 @@ document.addEventListener('DOMContentLoaded', () => {
     loadModels();
     loadLogs();
 
-    // Toggle API key field based on provider selection
-    document.getElementById('providerSelect').addEventListener('change', (e) => {
-        const apiKeyRow = document.getElementById('apiKeyRow');
-        apiKeyRow.style.display = e.target.value === 'opencode_zen' ? 'block' : 'none';
-    });
-
     // Log viewer controls
     document.getElementById('logClearBtn').addEventListener('click', () => {
         const view = document.getElementById('logView');

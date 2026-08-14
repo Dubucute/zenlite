@@ -1,13 +1,13 @@
 # ZenLite
 
-ZenLite is a lightweight OpenAI-compatible gateway for OpenCode Free and OpenCode Zen providers with proxy rotation and a simple dashboard.
+ZenLite is a lightweight OpenAI-compatible gateway for the free, no-auth OpenCode endpoint with proxy rotation and a simple dashboard.
 
 ## Features
 - OpenAI-compatible `/v1/chat/completions`
 - Full OpenAI-protocol passthrough — `tools` / `tool_choice` / `tool_calls`, `functions`, `response_format`, `stream_options`, ... are forwarded verbatim
 - Works with tool-calling clients like **GitHub Copilot agent mode**
-- Free (`oc/`) and Zen (`opencode/`) model prefixes
-- Direct-first proxy fallback
+- Free (`oc/`) model prefix
+- Direct-first proxy fallback with known-good proxy memory
 - Streaming support
 - Simple dashboard UI
 
